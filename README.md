@@ -1,12 +1,16 @@
-## My Project
+# Qwen on AWS Examples
 
-TODO: Fill this README out!
+![qwen-on-aws](images/logo.png)
 
-Be sure to:
+Welcome to the **Qwen on AWS** repository! This collection provides notebooks and examples to get started with Qwen models on AWS. Explore practical tutorials for deploying, fine-tuning, and building applications using Alibaba's Qwen family models on Amazon SageMaker, Amazon Bedrock, and other AWS services. Contributions welcome!
 
-* Change the title in this README
-* Edit your repository description on GitHub
 
+---------
+## What's New
+
+- 🎉 **Sep 2025**: Added Qwen3-Next-80B-A3B-Instruct deployment with vLLM BYOC on SageMaker
+
+---------
 ## Security
 
 See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
