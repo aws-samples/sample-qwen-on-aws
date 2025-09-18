@@ -1,11 +1,8 @@
-## My Project
+## Qwen on AWS examples
 
-TODO: Fill this README out!
+Welcome to the repository hosting example use of Qwen models on AWS! 
+Open a PR if you would like to contribute! :twisted_rightwards_arrows:
 
-Be sure to:
-
-* Change the title in this README
-* Edit your repository description on GitHub
 
 ## Security
 
