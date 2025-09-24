@@ -14,8 +14,7 @@ REPOSITORY_NAME="qwen-vllm-byoc"
 IMAGE_TAG="latest"
 IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPOSITORY_NAME}:${IMAGE_TAG}"
 
-echo "🐳 Building and pushing custom vLLM container for Voxtral model"
-echo "⚠️  IMPORTANT: Using vLLM >= 0.10.0 as required by Voxtral"
+
 echo "Repository: ${REPOSITORY_NAME}"
 echo "Image URI: ${IMAGE_URI}"
 echo "Region: ${AWS_REGION}"

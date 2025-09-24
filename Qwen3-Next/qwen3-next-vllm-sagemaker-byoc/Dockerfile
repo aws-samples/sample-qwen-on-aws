@@ -1,51 +1,19 @@
+# Simplified vLLM Container for Qwen3-Next Deployment on SageMaker
+# Uses native vLLM OpenAI-compatible server with environment variable configuration
 
-# Custom vLLM Container for Voxtral Model Deployment on SageMaker
-# =============================================================
-# Using official vLLM image as base to avoid compilation issues
-# and ensure compatibility with CUDA and vLLM 0.10+
+FROM vllm/vllm-openai:v0.10.2
 
-FROM --platform=linux/amd64 vllm/vllm-openai:latest
+# Copy the serve script that handles environment variable to CLI argument conversion
+COPY ./serve /usr/bin/serve
 
-# Set environment variables for SageMaker
-ENV MODEL_CACHE_DIR=/opt/ml/model
-ENV TRANSFORMERS_CACHE=/tmp/transformers_cache
-ENV HF_HOME=/tmp/hf_home
-ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
+# Make the serve script executable
+RUN chmod 755 /usr/bin/serve
 
-# Install system dependencies for audio processing
-RUN apt-get update && apt-get install -y \
-    libsndfile1 \
-    ffmpeg \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+# Create python symlink to python3 (fix for python not found)
+RUN ln -sf /usr/bin/python3 /usr/bin/python
 
-# Install additional dependencies for Voxtral audio processing and SageMaker BYOC
-RUN pip install --no-cache-dir \
-    boto3>=1.35.91 \
-    sagemaker>=2.236.1
+# Verify the serve script was copied correctly
+RUN ls -la /usr/bin/serve && head -5 /usr/bin/serve
 
-# Install vLLM >=0.10.2 as required for Qwen3-Next support
-RUN pip install 'vllm>=0.10.2' --extra-index-url https://wheels.vllm.ai/nightly
-
-# Create necessary directories
-RUN mkdir -p /opt/ml/model /opt/ml/code /tmp/transformers_cache /tmp/hf_home
-
-# Set working directory
-WORKDIR /opt/ml/code
-
-# Note: model.py, serving.properties, and requirements.txt will be provided via model_data
-
-# Health check - disabled during startup to prevent container startup failures
-# HEALTHCHECK --interval=30s --timeout=30s --start-period=120s --retries=3 \
-#     CMD curl -f http://localhost:8080/ping || exit 1
-
-# Expose the port for SageMaker
-EXPOSE 8080
-
-# Create serve script for SageMaker BYOC compatibility
-RUN printf '#!/bin/bash\nif [ "$1" = "serve" ]; then\n    echo "🚀 Starting vLLM BYOC container..."\n    echo "📁 Checking for files in /opt/ml/model/"\n    ls -la /opt/ml/model/ || echo "Cannot list /opt/ml/model/"\n    \n    # Install additional requirements if provided\n    if [ -f /opt/ml/model/requirements.txt ]; then\n        echo "📦 Installing additional requirements from /opt/ml/model/requirements.txt..."\n        pip install --root-user-action=ignore -r /opt/ml/model/requirements.txt\n    else\n        echo "⚠️  No requirements.txt found in /opt/ml/model/"\n    fi\n    \n    # Copy model files to code directory for execution\n    if [ -f /opt/ml/model/model.py ]; then\n        echo "📄 Copying model.py from /opt/ml/model/ to /opt/ml/code/"\n        cp /opt/ml/model/model.py /opt/ml/code/\n        chmod +x /opt/ml/code/model.py\n    else\n        echo "❌ ERROR: model.py not found in /opt/ml/model/"\n        echo "📁 Available files in /opt/ml/model/:"\n        ls -la /opt/ml/model/ || echo "Cannot list directory"\n        exit 1\n    fi\n    \n    if [ -f /opt/ml/model/serving.properties ]; then\n        echo "⚙️  Copying serving.properties from /opt/ml/model/ to /opt/ml/code/"\n        cp /opt/ml/model/serving.properties /opt/ml/code/\n    else\n        echo "⚠️  WARNING: serving.properties not found in /opt/ml/model/"\n    fi\n    \n    echo "✅ File setup complete. Starting model server..."\n    # Start the model server\n    exec python3 /opt/ml/code/model.py\nelse\n    exec "$@"\nfi\n' > /usr/local/bin/serve && \
-    chmod +x /usr/local/bin/serve
-
-# Set the entrypoint for SageMaker BYOC
-ENTRYPOINT ["/usr/local/bin/serve"]
-CMD ["serve"]
+# Set the entrypoint to our serve script
+ENTRYPOINT ["/usr/bin/serve"]
