@@ -1,0 +1,92 @@
+#!/bin/bash
+
+# Converts environment variables starting with OPTION_ to vLLM CLI arguments
+# Optimized for Qwen3-VL vision-language models
+#
+# Supported Models:
+#   - Qwen/Qwen3-VL-4B-Instruct (4B params, 1 GPU, ~12GB VRAM)
+#   - Qwen/Qwen3-VL-8B-Instruct (9B params, 1 GPU, ~24GB VRAM)
+#   - Qwen/Qwen3-VL-30B-A3B-Instruct (31B params MoE, 1-4 GPUs, ~48-192GB VRAM)
+#   - Qwen/Qwen3-VL-235B-A22B-Instruct (236B params MoE, 8 GPUs, ~384GB VRAM)
+
+echo "🚀 Starting vLLM BYOC container for Qwen3-VL..."
+
+# Set required defaults for SageMaker
+export OPTION_PORT=${OPTION_PORT:-8080}
+export OPTION_HOST=${OPTION_HOST:-0.0.0.0}
+
+# Set Qwen3-VL specific defaults (can be overridden via environment variables)
+# Default to 8B model, but can be changed via OPTION_MODEL env var to any supported variant
+export OPTION_MODEL=${OPTION_MODEL:-"Qwen/Qwen3-VL-8B-Instruct"}
+export OPTION_TENSOR_PARALLEL_SIZE=${OPTION_TENSOR_PARALLEL_SIZE:-1}
+export OPTION_MAX_MODEL_LEN=${OPTION_MAX_MODEL_LEN:-32768}
+export OPTION_GPU_MEMORY_UTILIZATION=${OPTION_GPU_MEMORY_UTILIZATION:-0.9}
+export OPTION_DTYPE=${OPTION_DTYPE:-auto}
+export OPTION_TRUST_REMOTE_CODE=${OPTION_TRUST_REMOTE_CODE:-true}
+export OPTION_ENFORCE_EAGER=${OPTION_ENFORCE_EAGER:-false}
+export OPTION_MAX_NUM_SEQS=${OPTION_MAX_NUM_SEQS:-32}
+export OPTION_DISABLE_LOG_STATS=${OPTION_DISABLE_LOG_STATS:-true}
+export OPTION_SERVED_MODEL_NAME=${OPTION_SERVED_MODEL_NAME:-qwen3-vl}
+
+# Enable vision and multimodal support
+# Note: limit-mm-per-prompt expects JSON format
+export OPTION_LIMIT_MM_PER_PROMPT=${OPTION_LIMIT_MM_PER_PROMPT:-'{"image":10,"video":1}'}
+export OPTION_MAX_NUM_BATCHED_TOKENS=${OPTION_MAX_NUM_BATCHED_TOKENS:-8192}
+
+# Enable tool calling support for Qwen3-VL
+export OPTION_ENABLE_AUTO_TOOL_CHOICE=${OPTION_ENABLE_AUTO_TOOL_CHOICE:-true}
+export OPTION_TOOL_CALL_PARSER=${OPTION_TOOL_CALL_PARSER:-hermes}
+
+echo "📋 Configuration:"
+echo "   Model: $OPTION_MODEL"
+echo "   Tensor Parallel Size: $OPTION_TENSOR_PARALLEL_SIZE"
+echo "   Max Model Length: $OPTION_MAX_MODEL_LEN"
+echo "   GPU Memory Utilization: $OPTION_GPU_MEMORY_UTILIZATION"
+echo "   Port: $OPTION_PORT"
+echo "   Vision Support: Enabled"
+
+# Build vLLM arguments from environment variables
+ARGS=""
+
+# Process all OPTION_ environment variables
+for var in $(env | grep ^OPTION_ | cut -d= -f1); do
+    # Convert variable name to CLI argument format
+    # OPTION_MODEL_NAME -> --model-name
+    arg_name=$(echo ${var#OPTION_} | tr '[:upper:]' '[:lower:]' | tr '_' '-')
+    arg_value="${!var}"
+
+    # Handle boolean values
+    if [[ "$arg_value" == "true" || "$arg_value" == "false" ]]; then
+        if [[ "$arg_value" == "true" ]]; then
+            ARGS="$ARGS --$arg_name"
+        fi
+    else
+        ARGS="$ARGS --$arg_name $arg_value"
+    fi
+done
+
+echo "🔧 Starting vLLM with arguments: $ARGS"
+
+# Check Python availability
+if command -v python3 >/dev/null 2>&1; then
+    PYTHON_CMD="python3"
+elif command -v python >/dev/null 2>&1; then
+    PYTHON_CMD="python"
+else
+    echo "❌ Error: Neither python nor python3 found in PATH"
+    echo "Available commands:"
+    which python* 2>/dev/null || echo "No python commands found"
+    exit 1
+fi
+
+echo "🐍 Using Python command: $PYTHON_CMD"
+
+# Verify vLLM is available
+if ! $PYTHON_CMD -c "import vllm" 2>/dev/null; then
+    echo "❌ Error: vLLM not found. Installing vLLM..."
+    pip install vllm>=0.10.2 || pip3 install vllm>=0.10.2
+fi
+
+# Start vLLM OpenAI-compatible server with vision support
+echo "🚀 Executing: $PYTHON_CMD -m vllm.entrypoints.openai.api_server $ARGS"
+exec $PYTHON_CMD -m vllm.entrypoints.openai.api_server $ARGS
