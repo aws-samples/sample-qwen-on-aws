@@ -307,7 +307,7 @@ def invoke():
         logger.error(f"Inference error: {str(e)}")
         import traceback
         logger.error(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Internal server error"}), 500
 
 
 if __name__ == "__main__":
