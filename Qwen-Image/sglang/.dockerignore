@@ -1,0 +1,19 @@
+# Exclude build logs and temporary files from Docker context
+build.log
+build-attempt2.log
+*.log
+.ipynb_checkpoints/
+*.ipynb
+.claude/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.git/
+.gitignore
