@@ -1,0 +1,124 @@
+# The vLLM server that generates the student's own rollouts, instead of calling HuggingFace
+# `generate` in the training process. Enabled by default in the shipped layout (GPU 3).
+#
+# WHY
+# ---
+# The training loop spends most of its wall clock generating rollouts, not computing
+# gradients. HF `generate` decodes without continuous batching or paged attention, so a step
+# that produces 32 x 512 tokens is roughly 5-10x slower than the same work through vLLM. At
+# 3000 steps that is the difference between a run that finishes overnight and one that does
+# not finish. Nothing about the objective changes -- only who produces the tokens.
+#
+# HOW THE STUDENT STAYS CURRENT
+# -----------------------------
+# The trainer trains a LoRA adapter and hot-swaps it into this server every
+# SAMPLER_SYNC_EVERY steps (POST /v1/load_lora_adapter), so the sampler's policy lags the
+# live policy by at most that many steps. That lag is real and is handled honestly rather
+# than ignored: BUFFER_MAX_AGE defaults to SAMPLER_SYNC_EVERY, the PPO importance ratio
+# corrects for the remaining off-policyness, and `clip_frac` / `policy_drift` are logged so
+# too much lag is visible. If `clip_frac` climbs above ~0.2, lower SAMPLER_SYNC_EVERY.
+#
+# COST
+# ----
+# One GPU. On the single-node layout that is GPU 3 -- the device left over after the teacher's
+# TEACHER_TP (=2) and the trainer's GPU_PER_NODE (=1), which fills the node exactly. Two
+# caveats specific to that layout:
+#
+#  * The eval Job also wants a GPU. teacher(2) + sampler(1) + trainer(1) = 4 leaves nothing
+#    for the eval, so it will sit Pending until either the trainer Completes and frees GPU 2
+#    or this Deployment is deleted to free GPU 3. If the eval sits Pending, check that with
+#    `kubectl get pods` before assuming a manifest problem.
+#  * A second copy of the student plus its KV cache lives on this node. That is comfortable at
+#    NODE_GPUS=4, but set SAMPLER_GPUS=0 in env_vars whenever this Deployment is absent so
+#    preflight check [8] is arithmetic about reality rather than intent.
+#
+# To skip it, leave STUDENT_SAMPLER_URL empty and the trainer samples in-process with
+# transformers -- correct, just slower.
+#
+#   set -a && source manifests/env_vars && set +a
+#   envsubst < manifests/student-sampler.yaml-template | kubectl --context "$CTX" apply -f -
+#   # then set, in env_vars, and re-apply the ConfigMap:
+#   export STUDENT_SAMPLER_URL=http://student-sampler.$NAMESPACE.svc.cluster.local:8000/v1
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: student-sampler
+  namespace: ${NAMESPACE}
+  labels: { app: student-sampler }
+spec:
+  replicas: 1
+  # Recreate, not the default rolling update: the node's GPUs are fully partitioned, so a
+  # surge pod could never schedule and a changed spec would wait on it forever.
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: student-sampler }
+  template:
+    metadata:
+      labels: { app: student-sampler }
+    spec:
+      nodeSelector:
+        node.kubernetes.io/instance-type: ${INSTANCE_TYPE}
+      tolerations:
+        - key: sagemaker.amazonaws.com/node-health-status
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: vllm
+          image: ${VLLM_IMAGE}
+          command: ["/bin/bash", "-c"]
+          args:
+            - >
+              vllm serve ${STUDENT_MODEL}
+              --served-model-name ${STUDENT_MODEL}
+              --tensor-parallel-size 1
+              --dtype bfloat16
+              --host 0.0.0.0 --port 8000
+              --gpu-memory-utilization 0.85
+              --max-model-len ${TEACHER_MAX_MODEL_LEN}
+              --max-num-seqs ${GROUP_SIZE}
+              --enable-lora
+              --max-lora-rank ${LORA_R}
+              --max-loras 2
+              --max-logprobs 1
+              --return-tokens-as-token-ids
+          ports:
+            - { containerPort: 8000 }
+          env:
+            - { name: HF_HOME, value: "${HF_HOME}" }
+            # Required for POST /v1/load_lora_adapter. Without it the trainer's adapter
+            # sync is rejected and the sampler would silently keep serving the BASE student
+            # for the whole run -- i.e. the rollouts would never reflect any training.
+            - { name: VLLM_ALLOW_RUNTIME_LORA_UPDATING, value: "1" }
+            - { name: NCCL_IB_DISABLE, value: "1" }
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+          readinessProbe:
+            httpGet: { path: /v1/models, port: 8000 }
+            initialDelaySeconds: 90
+            periodSeconds: 10
+            failureThreshold: 90
+          volumeMounts:
+            # /fsx must be mounted: the trainer writes the adapter here and passes a PATH
+            # (not bytes) to load_lora_adapter, so this pod has to be able to read it.
+            - { name: fsx, mountPath: /fsx }
+            - { name: s3,  mountPath: /s3 }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: fsx
+          persistentVolumeClaim: { claimName: ${FSX_CLAIM} }
+        - name: s3
+          persistentVolumeClaim: { claimName: ${S3_CLAIM} }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 16Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: student-sampler
+  namespace: ${NAMESPACE}
+spec:
+  type: ClusterIP
+  selector: { app: student-sampler }
+  ports:
+    - { name: http, port: 8000, targetPort: 8000 }

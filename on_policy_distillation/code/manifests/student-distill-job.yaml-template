@@ -1,0 +1,100 @@
+# STAGE 1 of 2: the on-policy distillation loop (src/train_distill.py).
+#
+# Runs on the SAME single ml.g5.24xlarge as the teacher, taking GPU_PER_NODE (=1) of the four
+# devices; the teacher holds TEACHER_TP (=2) and the sampler holds the last one, so the node
+# is exactly full. K8s allocates GPUs exclusively, so there is no device overlap — but there
+# IS contention the manifests cannot express: the teacher's TP all-reduce and this pod's
+# HF-cache reads share the node's PCIe bus and /fsx mount. That is the price of the single-node
+# constraint, and it is why the teacher runs bf16 at TP=2 (~9 GiB/rank) rather than trying to
+# fit unquantised weights on one A10G.
+#
+# Because everything is co-resident, the teacher Service resolves to a pod on this same node;
+# scoring requests never leave it, which is the one silver lining (no cross-node hop).
+#
+# This cluster has NO Kubeflow PyTorchJob CRD, so we use a plain K8s Job (single GPU).
+# For fault-tolerant multi-node, launch instead through the HyperPod Training Operator or a
+# verl RayJob (KubeRay is installed here) -- see LAUNCH.md.
+#
+#   set -a && source manifests/env_vars && set +a
+#   aws s3 sync src s3://${S3_BUCKET}/opd/src
+#   envsubst < manifests/opd-config.yaml-template          | kubectl --context "$CTX" apply -f -
+#   envsubst < manifests/student-distill-job.yaml-template | kubectl --context "$CTX" apply -f -
+#
+# NO ARGUMENTS ARE PASSED: every flag defaults from the opd-config ConfigMap, so
+# manifests/env_vars is the single place a knob is set. Args on the command line here would
+# silently win over the ConfigMap and are exactly the drift this layout removes.
+#
+# The trainer runs `preflight.py` first and exits non-zero if the teacher is not returning
+# real log-probs, if the tokenizers differ, or if train/eval prompt formats disagree -- all
+# failures that otherwise produce a clean-looking run with a meaningless result. It then
+# gates on a step-0 sanity check: if the measured reverse KL is not positive, it exits 3
+# rather than spend hours optimising the student against noise.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: opd-student
+  namespace: ${NAMESPACE}
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels: { app: opd-student }
+    spec:
+      restartPolicy: OnFailure
+      nodeSelector:
+        node.kubernetes.io/instance-type: ${INSTANCE_TYPE}
+      tolerations:
+        - key: sagemaker.amazonaws.com/node-health-status
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: trainer
+          image: ${TRAIN_IMAGE}
+          envFrom:
+            - configMapRef: { name: opd-config }
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef: { name: hf-token, key: token, optional: true }
+            # A 2048-token sequence's fp32 [T, 248k] logits are ~2 GiB each (x ~4 with the
+            # softmax and its grad); with a fragmented cache the trainer hit "allocation failed
+            # with OOM ... retrying" at ~22 GiB. Expandable segments let the allocator grow blocks
+            # instead of needing one contiguous free chunk.
+            - { name: PYTORCH_CUDA_ALLOC_CONF, value: "expandable_segments:True" }
+          # args only, no `command`: the PyTorch DLC's ENTRYPOINT runs first and enables CUDA
+          # forward compatibility (its CUDA 13.3 runtime is newer than the node driver).
+          args:
+            # The image ships PyTorch only. transformers is pinned to the vLLM image's version, so
+            # the trainer runs the same Qwen3.5 model code as the teacher and the sampler.
+            # peft: LoRA. bitsandbytes: only for 8-bit Adam (ADAM_8BIT=1).
+            # NOTE: every line of the script must stay at the SAME indentation. YAML's folded
+            # scalar (>) joins equally-indented lines with spaces but preserves a newline
+            # before a MORE-indented one, which would split a command in half.
+            - /bin/bash
+            - -c
+            - >
+              pip install -q "transformers==5.15.1" "peft>=0.11" "datasets" "openai>=1.40" "flash-linear-attention" &&
+              if [ "${ADAM_8BIT}" = 1 ]; then pip install -q "bitsandbytes>=0.43"; fi &&
+              until python3 -c "import urllib.request; urllib.request.urlopen('${TEACHER_URL}/models')" 2>/dev/null; do
+                echo "waiting for teacher ${TEACHER_URL} ..."; sleep 15; done &&
+              if [ -n "${STUDENT_SAMPLER_URL}" ]; then
+                until python3 -c "import urllib.request; urllib.request.urlopen('${STUDENT_SAMPLER_URL}/models')" 2>/dev/null; do
+                  echo "waiting for student sampler ${STUDENT_SAMPLER_URL} ..."; sleep 15; done;
+              fi &&
+              cd ${CODE_DIR} &&
+              python3 preflight.py &&
+              torchrun --nproc_per_node=${GPU_PER_NODE} train_distill.py
+          resources:
+            limits:
+              nvidia.com/gpu: ${GPU_PER_NODE}
+          volumeMounts:
+            - { name: fsx, mountPath: /fsx }   # HF cache + checkpoints + metrics (high throughput)
+            - { name: s3,  mountPath: /s3 }    # model registry + code
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: fsx
+          persistentVolumeClaim: { claimName: ${FSX_CLAIM} }
+        - name: s3
+          persistentVolumeClaim: { claimName: ${S3_CLAIM} }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 16Gi }

@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>On-Policy Distillation on SageMaker HyperPod — Workflow</title>
+<style>
+  :root {
+    --navy: #232f3e; --orange: #ff9900; --grey: #9aa0a6; --teal: #0f766e;
+    --ink: #16191f; --muted: #5f6b7a; --line: #d5dbe3;
+  }
+  @page { size: 1920px 1080px; margin: 0; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Amazon Ember", -apple-system, "Helvetica Neue", Arial, sans-serif; color: var(--ink); background: #fff; }
+  .slide { position: relative; width: 1920px; height: 1080px; overflow: hidden; }
+
+  header { position: absolute; left: 70px; top: 50px; right: 70px; }
+  h1 { font-size: 52px; font-weight: 700; letter-spacing: -0.5px; }
+  h1 span { color: var(--orange); }
+  .sub { margin-top: 10px; font-size: 26px; color: var(--muted); }
+
+  /* step row */
+  .step { position: absolute; top: 230px; width: 220px; height: 250px; border: 2px solid var(--line); border-radius: 16px;
+          padding: 22px 18px; text-align: center; background: #fff; }
+  .step .num { width: 46px; height: 46px; margin: 0 auto 14px; border-radius: 50%; background: var(--navy); color: #fff;
+               font-size: 24px; font-weight: 700; display: flex; align-items: center; justify-content: center; }
+  .step h2 { font-size: 27px; font-weight: 700; margin-bottom: 10px; }
+  .step p { font-size: 19px; line-height: 1.35; color: var(--muted); }
+  .step.hl { border-color: var(--orange); background: #fffaf2; }
+  .step.hl .num { background: var(--orange); color: var(--ink); }
+
+  .phase { position: absolute; top: 190px; font-size: 17px; font-weight: 700; letter-spacing: 2px; color: var(--muted); }
+
+  /* bottom panels */
+  .panel { position: absolute; top: 560px; height: 420px; border-radius: 16px; padding: 26px 30px; }
+  .panel h3 { font-size: 26px; font-weight: 700; margin-bottom: 4px; }
+  .panel .cap { font-size: 19px; color: var(--muted); }
+  .loop { left: 70px; width: 1060px; border: 2px solid var(--orange); background: #fffaf2; }
+  .hw { left: 1170px; width: 680px; border: 2px solid var(--navy); }
+
+  .node { position: absolute; top: 150px; width: 270px; height: 120px; background: #fff; border: 3px solid; border-radius: 12px;
+          display: flex; flex-direction: column; justify-content: center; text-align: center; }
+  .node b { font-size: 24px; }
+  .node small { font-size: 18px; color: var(--muted); margin-top: 4px; }
+
+  .gpus { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 22px; }
+  .gpu { border-radius: 10px; color: #fff; padding: 14px 18px; font-size: 21px; font-weight: 600; }
+  .gpu b { display: block; font-size: 15px; letter-spacing: 1.5px; opacity: 0.85; font-weight: 700; margin-bottom: 2px; }
+  .storage { margin-top: 22px; font-size: 19px; line-height: 1.5; color: var(--muted); }
+  .storage b { color: var(--ink); }
+
+  svg { position: absolute; left: 0; top: 0; pointer-events: none; }
+</style>
+</head>
+<body>
+<div class="slide">
+
+  <header>
+    <h1>On-Policy Distillation on HyperPod — <span>code to eval dashboard</span></h1>
+    <div class="sub">Qwen3.5-9B teacher &rarr; Qwen3.5-2B student (LoRA r=128) · GSM8K · no SFT · one ml.g5.24xlarge · driven from one notebook</div>
+  </header>
+
+  <div class="phase" style="left:70px">SETUP — ONCE</div>
+  <div class="phase" style="left:850px">BASELINE — ONCE</div>
+  <div class="phase" style="left:1110px">RUN — EACH EXPERIMENT</div>
+
+  <!-- 7 steps: left 70, width 220, pitch 260 -->
+  <div class="step" style="left:70px"><div class="num">1</div><h2>Code</h2><p>Infra template, training &amp; eval code, notebook</p></div>
+  <div class="step" style="left:330px"><div class="num">2</div><h2>Provision</h2><p>CloudFormation: EKS, HyperPod, FSx, S3</p></div>
+  <div class="step" style="left:590px"><div class="num">3</div><h2>Configure</h2><p>Code &amp; weights to S3, one ConfigMap</p></div>
+  <div class="step" style="left:850px; border-color:var(--teal); background:#f0fdfa"><div class="num" style="background:var(--teal)">4</div><h2>Baseline</h2><p>Eval the teacher and each candidate<br>&rarr; pick the student</p></div>
+  <div class="step hl" style="left:1110px"><div class="num">5</div><h2>Distill</h2><p>On-policy loop, 2B LoRA student, no warm-up</p></div>
+  <div class="step" style="left:1370px"><div class="num">6</div><h2>Evaluate</h2><p>GSM8K: after, greedy + 8-vote majority, vs. the baseline</p></div>
+  <div class="step" style="left:1630px; border-color:var(--navy)"><div class="num">7</div><h2>Dashboard</h2><p>Base · distilled · teacher<br>greedy + 8-vote<br>gap closed</p></div>
+
+  <!-- step 5 detail -->
+  <div class="panel loop">
+    <h3>Inside step 5 — the on-policy loop</h3>
+    <div class="cap">The student learns from the teacher's feedback on its own outputs</div>
+    <div class="node" style="left:30px;  border-color:var(--teal)"><b>Student samples</b><small>64 prompts × 4 answers</small></div>
+    <div class="node" style="left:393px; border-color:var(--navy)"><b>Teacher scores</b><small>every token of those answers</small></div>
+    <div class="node" style="left:756px; border-color:var(--orange)"><b>Student updates</b><small>reverse KL · answer masked</small></div>
+  </div>
+
+  <!-- hardware -->
+  <div class="panel hw">
+    <h3>One node, four GPUs</h3>
+    <div class="cap">Each GPU belongs to exactly one job</div>
+    <div class="gpus">
+      <div class="gpu" style="background:var(--navy)"><b>GPU 0</b>Teacher</div>
+      <div class="gpu" style="background:var(--navy)"><b>GPU 1</b>Teacher</div>
+      <div class="gpu" style="background:var(--orange);color:var(--ink)"><b>GPU 2</b>Student trainer</div>
+      <div class="gpu" style="background:var(--teal)"><b>GPU 3</b>Student sampler + eval</div>
+    </div>
+    <div class="storage"><b>/fsx</b> FSx for Lustre — checkpoints, metrics, results<br><b>/s3</b> S3 — code and model weights</div>
+  </div>
+
+  <svg width="1920" height="1080" viewBox="0 0 1920 1080">
+    <defs>
+      <marker id="g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#5f6b7a"/></marker>
+      <marker id="o" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#ff9900"/></marker>
+    </defs>
+    <!-- step arrows: box right edge x+220, next box at x+260, mid y 355 -->
+    <g stroke="#5f6b7a" stroke-width="3.5" fill="none" marker-end="url(#g)">
+      <path d="M293,355 L325,355"/><path d="M553,355 L585,355"/><path d="M813,355 L845,355"/>
+      <path d="M1073,355 L1105,355"/><path d="M1333,355 L1365,355"/><path d="M1593,355 L1625,355"/>
+    </g>
+    <!-- step 5 zooms into the loop panel -->
+    <path d="M1220,482 L1220,520 L600,520 L600,556" stroke="#ff9900" stroke-width="3" stroke-dasharray="8 6" fill="none" marker-end="url(#o)"/>
+    <!-- loop: panel inner origin (72,562); nodes top 712, h 120, mid 772 -->
+    <g stroke="#ff9900" stroke-width="4" fill="none" marker-end="url(#o)">
+      <path d="M374,772 L457,772"/>
+      <path d="M737,772 L820,772"/>
+      <path d="M965,836 L965,900 L237,900 L237,840"/>
+    </g>
+    <text x="601" y="940" text-anchor="middle" font-size="21" font-weight="700" fill="#b36b00"
+          font-family="-apple-system, Helvetica Neue, Arial, sans-serif">repeat — the updated adapter is hot-swapped into the sampler every step</text>
+  </svg>
+
+</div>
+</body>
+</html>

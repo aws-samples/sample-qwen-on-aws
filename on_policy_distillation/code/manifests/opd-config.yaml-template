@@ -1,0 +1,121 @@
+# One ConfigMap holding the whole run configuration, consumed by every pod via `envFrom`.
+#
+# Apply this FIRST -- the distill and eval Jobs both reference it:
+#   set -a && source manifests/env_vars && set +a
+#   envsubst < manifests/opd-config.yaml-template | kubectl --context "$CTX" apply -f -
+#
+# Why a ConfigMap instead of an `env:` list per Job: one place to add a knob, and no pod can
+# run with a stale copy of a value. Every CLI flag in src/*.py defaults from one of these
+# names, so the Jobs pass NO arguments -- this ConfigMap is the entire interface, and
+# `manifests/env_vars` is its only source. A new variable must be listed here to reach a pod.
+#
+# After editing env_vars, re-apply this and delete/recreate the Jobs (Jobs are immutable,
+# and a running pod does not pick up ConfigMap changes to env).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opd-config
+  namespace: ${NAMESPACE}
+data:
+  # --- shared ---
+  HF_HOME: "${HF_HOME}"
+  CODE_DIR: "${CODE_DIR}"
+  TEACHER_URL: "${TEACHER_URL}"
+  TEACHER_MODEL_ID: "${TEACHER_MODEL_ID}"
+  STUDENT_MODEL: "${STUDENT_MODEL}"
+  TRUST_REMOTE_CODE: "${TRUST_REMOTE_CODE}"
+  SEED: "${SEED}"
+
+  # --- task / data ---
+  TASK: "${TASK}"
+  TRAIN_DATASET: "${TRAIN_DATASET}"
+  TRAIN_DATASET_CONFIG: "${TRAIN_DATASET_CONFIG}"
+  TRAIN_SPLIT: "${TRAIN_SPLIT}"
+  PROMPT_POOL_LIMIT: "${PROMPT_POOL_LIMIT}"
+  TRAIN_FEWSHOT: "${TRAIN_FEWSHOT}"
+  CHAT_TEMPLATE: "${CHAT_TEMPLATE}"
+  ENABLE_THINKING: "${ENABLE_THINKING}"
+
+  # --- stage 1: on-policy distillation ---
+  RUN_DIR: "${RUN_DIR}"
+  INIT_ADAPTER: "${INIT_ADAPTER}"    # empty = train from the base student; a
+                                     # ${RUN_DIR}/student-step<N> path = resume after a crash
+  STEPS: "${STEPS}"
+  GROUP_SIZE: "${GROUP_SIZE}"
+  SAMPLES_PER_PROMPT: "${SAMPLES_PER_PROMPT}"   # rollouts per prompt; GROUP_SIZE = prompts x this
+  BATCH_SIZE: "${BATCH_SIZE}"
+  MICRO_BATCH_SIZE: "${MICRO_BATCH_SIZE}"
+  GEN_MICRO_BATCH: "${GEN_MICRO_BATCH}"
+  BUFFER_CAPACITY: "${BUFFER_CAPACITY}"
+  BUFFER_MAX_AGE: "${BUFFER_MAX_AGE}"
+  MAX_NEW_TOKENS: "${MAX_NEW_TOKENS}"
+  MAX_QUESTION_TOKENS: "${MAX_QUESTION_TOKENS}"
+  TRAIN_TEMPERATURE: "${TRAIN_TEMPERATURE}"
+  TRUNCATED_POLICY: "${TRUNCATED_POLICY}"
+  KL_COEF: "${KL_COEF}"
+  RKL_CLIP: "${RKL_CLIP}"
+  CLIP_RATIO: "${CLIP_RATIO}"
+  LOSS_NORM: "${LOSS_NORM}"          # token (default) | sequence (per-rollout weighting)
+  ANSWER_SPAN_POLICY: "${ANSWER_SPAN_POLICY}"             # none | mask (zero credit on the final-answer line)
+  TRUNCATION_PENALTY: "${TRUNCATION_PENALTY}"             # 0 = off; needs TRUNCATED_POLICY mask|keep
+  TRUNCATION_PENALTY_TAIL: "${TRUNCATION_PENALTY_TAIL}"
+  WHITEN_ADVANTAGES: "${WHITEN_ADVANTAGES}"
+  PRECISION: "${PRECISION}"
+  LORA_R: "${LORA_R}"
+  LORA_ALPHA: "${LORA_ALPHA}"
+  LR: "${LR}"
+  WEIGHT_DECAY: "${WEIGHT_DECAY}"
+  WARMUP_RATIO: "${WARMUP_RATIO}"
+  GRAD_CLIP: "${GRAD_CLIP}"
+  ADAM_8BIT: "${ADAM_8BIT}"
+  SAVE_EVERY: "${SAVE_EVERY}"
+  LOG_EVERY: "${LOG_EVERY}"
+  TEACHER_CONCURRENCY: "${TEACHER_CONCURRENCY}"
+  GPU_PER_NODE: "${GPU_PER_NODE}"
+  STUDENT_SAMPLER: "${STUDENT_SAMPLER}"
+  STUDENT_SAMPLER_URL: "${STUDENT_SAMPLER_URL}"
+  SAMPLER_SYNC_EVERY: "${SAMPLER_SYNC_EVERY}"
+
+
+  # --- stage 2: eval ---
+  EVAL_PHASE: "${EVAL_PHASE}"
+  EVAL_BASE_MODEL: "${EVAL_BASE_MODEL}"
+  EVAL_FT_MODEL_DIR: "${EVAL_FT_MODEL_DIR}"
+  EVAL_STUDENT_URL: "${EVAL_STUDENT_URL}"   # empty = local hf; set = before/after via the sampler
+  EVAL_DIR: "${EVAL_DIR}"
+  EVAL_SPLIT: "${EVAL_SPLIT}"
+  EVAL_LIMIT: "${EVAL_LIMIT}"
+  EVAL_SELECT: "${EVAL_SELECT}"
+  EVAL_FEWSHOT: "${EVAL_FEWSHOT}"
+  EVAL_MAX_TOKENS: "${EVAL_MAX_TOKENS}"
+  EVAL_TEMPERATURE: "${EVAL_TEMPERATURE}"
+  EVAL_VOTES: "${EVAL_VOTES}"                  # >1 = majority vote over that many samples, for EVAL_VOTE_PHASES
+  EVAL_VOTE_PHASES: "${EVAL_VOTE_PHASES}"      # default after: greedy base + teacher, voted distilled student
+  EVAL_VOTE_TEMPERATURE: "${EVAL_VOTE_TEMPERATURE}"
+  EVAL_BATCH_SIZE: "${EVAL_BATCH_SIZE}"
+  EVAL_TEACHER_CONNECTIONS: "${EVAL_TEACHER_CONNECTIONS}"
+  EVAL_CHAT_TEMPLATE: "${EVAL_CHAT_TEMPLATE}"
+  EVAL_TORCH_DTYPE: "${EVAL_TORCH_DTYPE}"
+  EVAL_ANSWER_REL_TOL: "${EVAL_ANSWER_REL_TOL}"
+  EVAL_TEXT_SIMILARITY: "${EVAL_TEXT_SIMILARITY}"
+  EVAL_SUMMARY_NAME: "${EVAL_SUMMARY_NAME}"
+
+  # --- preflight arithmetic ---
+  # These describe the hardware partition rather than any single pod, which is exactly why
+  # they belong here: preflight check [8] adds TEACHER_TP x TEACHER_REPLICAS + GPU_PER_NODE +
+  # SAMPLER_GPUS and fails if the total exceeds NODE_GPUS. On one shared node that sum is the
+  # whole ballgame -- and TEACHER_REPLICAS is why the teacher term is a PRODUCT: as configured
+  # (TP=2 x 1 replica) it is two devices and the node is 4 of 4 claimed (2 + 1 + 1). Counting
+  # TP alone would miss the moment TEACHER_REPLICAS goes above 1.
+  NODE_GPUS: "${NODE_GPUS}"
+  SAMPLER_GPUS: "${SAMPLER_GPUS}"
+  TEACHER_TP: "${TEACHER_TP}"
+  TEACHER_REPLICAS: "${TEACHER_REPLICAS}"
+  TEACHER_DTYPE: "${TEACHER_DTYPE}"
+  TEACHER_QUANTIZATION: "${TEACHER_QUANTIZATION}"
+  TEACHER_GPU_UTIL: "${TEACHER_GPU_UTIL}"
+  TEACHER_MAX_MODEL_LEN: "${TEACHER_MAX_MODEL_LEN}"
+  TEACHER_PARAMS_B: "${TEACHER_PARAMS_B}"
+  TEACHER_WEIGHTS_GIB: "${TEACHER_WEIGHTS_GIB}"   # measured checkpoint size; empty = estimate
+  STUDENT_PARAMS_B: "${STUDENT_PARAMS_B}"
+  GPU_MEM_GB: "${GPU_MEM_GB}"

@@ -1,0 +1,12 @@
+# Python bytecode (py_compile / imports during local verification)
+__pycache__/
+*.py[cod]
+
+# Local renders of the manifest templates -- env_vars is the source of truth,
+# so a rendered .yaml is a build artifact and must never be committed.
+manifests/*.yaml
+!manifests/*.yaml-template
+
+# Run outputs, if anyone points RUN_DIR/EVAL_DIR at the repo instead of /fsx
+*.jsonl
+build.log

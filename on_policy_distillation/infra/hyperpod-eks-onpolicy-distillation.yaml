@@ -1,0 +1,2438 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >-
+  SageMaker HyperPod (EKS-orchestrated) reference stack for on-policy distillation.
+  Creates a VPC, an EKS cluster with the HyperPod add-ons, an FSx for Lustre file
+  system, an S3 bucket wired for Mountpoint-S3 on EKS and for SageMaker Studio,
+  Amazon Managed Prometheus + Managed Grafana observability, a HyperPod cluster
+  named hp-cluster-onpolicy-distillation, and a new SageMaker Studio domain with
+  access to the HyperPod cluster. The domain ships with a JupyterLab space and a
+  lifecycle configuration that clones the on-policy distillation repository into
+  the space and pre-fills its cluster-specific environment variables.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: Naming}
+        Parameters: [ResourceNamePrefix, HyperPodClusterName]
+      - Label: {default: Network}
+        Parameters: [VpcCIDR, PrimaryAvailabilityZoneIndex]
+      - Label: {default: EKS}
+        Parameters: [KubernetesVersion, AdminPrincipalArn]
+      - Label: {default: HyperPod instance groups}
+        Parameters:
+          - GeneralPurposeInstanceType
+          - GeneralPurposeInstanceCount
+          - AcceleratedInstanceType
+          - AcceleratedInstanceCount
+          - AcceleratedEbsVolumeSizeInGB
+      - Label: {default: FSx for Lustre}
+        Parameters:
+          - FsxStorageCapacity
+          - FsxPerUnitStorageThroughput
+          - FsxDeploymentType
+          - FsxFileSystemTypeVersion
+          - FsxDataCompressionType
+      - Label: {default: Observability}
+        Parameters:
+          - CreateGrafanaWorkspace
+          - TrainingMetricLevel
+          - ClusterMetricLevel
+          - NodeMetricLevel
+          - AcceleratedComputeMetricLevel
+          - NetworkMetricLevel
+          - RayMetricLevel
+          - TaskGovernanceMetricLevel
+          - ScalingMetricLevel
+          - ObservabilityLoggingEnabled
+      - Label: {default: SageMaker Studio}
+        Parameters:
+          - CreateStudioDomain
+          - StudioDomainName
+          - StudioUserProfileName
+          - CreateStudioSpace
+          - StudioSpaceName
+          - StudioSpaceInstanceType
+          - StudioSpaceEbsVolumeSizeInGB
+      - Label: {default: Notebook code repository}
+        Parameters: [GitRepositoryUrl, GitRepositoryBranch]
+      - Label: {default: Cluster dependencies (Helm)}
+        Parameters: [HelmRepoUrl, HelmRepoPath, HelmRelease, HelmNamespace, HelmOperators]
+
+Parameters:
+
+  ResourceNamePrefix:
+    Type: String
+    Default: hp-onpolicy-distill
+    AllowedPattern: '[a-z0-9][a-z0-9-]{2,26}'
+    Description: >-
+      Prefix applied to every resource name created by this stack. Lowercase
+      letters, digits and hyphens only (S3 bucket naming rules apply).
+
+  HyperPodClusterName:
+    Type: String
+    Default: hp-cluster-onpolicy-distillation
+    Description: Name of the SageMaker HyperPod cluster.
+
+  VpcCIDR:
+    Type: String
+    Default: 10.192.0.0/16
+    Description: >-
+      Primary CIDR for the VPC. Public and EKS subnets are carved out of this
+      range as /24s. HyperPod node subnets get their own secondary /16 per AZ
+      (10.1.0.0/16 - 10.4.0.0/16) so training fleets never run out of addresses.
+
+  PrimaryAvailabilityZoneIndex:
+    Type: Number
+    Default: 0
+    AllowedValues: [0, 1, 2, 3]
+    Description: >-
+      Which of the four AZs hosts the FSx for Lustre file system and the
+      accelerated instance group. Co-locating them keeps Lustre traffic in-AZ.
+
+  KubernetesVersion:
+    Type: String
+    Default: '1.34'
+    Description: >-
+      Kubernetes version for the EKS cluster. 1.34 is the minimum for the HyperPod
+      task-governance add-on: its Kueue controller watches resource.k8s.io/v1
+      (DeviceClass), which 1.33 does not serve, and crash-loops there, blocking
+      every Job. Leave empty to use the latest version EKS offers in standard
+      support, resolved at stack creation time.
+
+  AdminPrincipalArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional IAM role/user ARN to grant cluster-admin access on the EKS
+      cluster (in addition to the stack creator). Leave blank to skip.
+
+  GeneralPurposeInstanceType:
+    Type: String
+    Default: ml.m5.4xlarge
+    Description: Instance type for the general-purpose (login / control) instance group.
+
+  GeneralPurposeInstanceCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Node count for the general-purpose instance group.
+
+  AcceleratedInstanceType:
+    Type: String
+    Default: ml.g5.24xlarge
+    Description: Instance type for the accelerated (GPU) instance group.
+
+  AcceleratedInstanceCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: Node count for the accelerated instance group.
+
+  AcceleratedEbsVolumeSizeInGB:
+    Type: Number
+    Default: 500
+    MinValue: 100
+    Description: Root EBS volume size for accelerated nodes, in GiB.
+
+  FsxStorageCapacity:
+    Type: Number
+    Default: 1200
+    Description: FSx for Lustre storage capacity in GiB (multiples of 1200 for PERSISTENT_2).
+
+  FsxPerUnitStorageThroughput:
+    Type: Number
+    Default: 250
+    AllowedValues: [125, 250, 500, 1000]
+    Description: FSx for Lustre throughput per TiB of storage (MB/s/TiB).
+
+  FsxDeploymentType:
+    Type: String
+    Default: PERSISTENT_2
+    AllowedValues: [PERSISTENT_1, PERSISTENT_2]
+    Description: FSx for Lustre deployment type.
+
+  FsxFileSystemTypeVersion:
+    Type: String
+    Default: '2.15'
+    Description: Lustre version.
+
+  FsxDataCompressionType:
+    Type: String
+    Default: LZ4
+    AllowedValues: [NONE, LZ4]
+    Description: FSx for Lustre data compression.
+
+  CreateGrafanaWorkspace:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Create an Amazon Managed Grafana workspace for the HyperPod dashboards.
+      REQUIRES AWS IAM Identity Center to be enabled in this region - set this
+      to false if it is not, otherwise stack creation fails.
+
+  TrainingMetricLevel:
+    Type: String
+    Default: BASIC
+    AllowedValues: [DISABLED, BASIC, ADVANCED]
+  ClusterMetricLevel:
+    Type: String
+    Default: BASIC
+    AllowedValues: [DISABLED, BASIC, ADVANCED]
+  NodeMetricLevel:
+    Type: String
+    Default: BASIC
+    AllowedValues: [DISABLED, BASIC, ADVANCED]
+  AcceleratedComputeMetricLevel:
+    Type: String
+    Default: BASIC
+    AllowedValues: [DISABLED, BASIC, ADVANCED]
+  NetworkMetricLevel:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [DISABLED, BASIC, ADVANCED]
+  RayMetricLevel:
+    Type: String
+    Default: ADVANCED
+    AllowedValues: [DISABLED, BASIC, ADVANCED]
+  TaskGovernanceMetricLevel:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [DISABLED, BASIC, ADVANCED]
+  ScalingMetricLevel:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [DISABLED, BASIC, ADVANCED]
+
+  ObservabilityLoggingEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Ship container logs from the observability add-on to CloudWatch Logs.
+
+  CreateStudioDomain:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Create a SageMaker Studio domain wired to the HyperPod cluster.
+
+  StudioDomainName:
+    Type: String
+    Default: hp-onpolicy-distillation-studio
+    Description: Name of the SageMaker Studio domain.
+
+  StudioUserProfileName:
+    Type: String
+    Default: distillation-researcher
+    Description: Name of the default Studio user profile.
+
+  CreateStudioSpace:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Create a private JupyterLab space in the Studio domain, owned by the default
+      user profile, with the distillation repository cloned into it. Ignored when
+      CreateStudioDomain is false.
+
+  StudioSpaceName:
+    Type: String
+    Default: opd-jupyterlab
+    AllowedPattern: '[a-zA-Z0-9](-*[a-zA-Z0-9]){0,62}'
+    Description: Name of the JupyterLab space created in the Studio domain.
+
+  StudioSpaceInstanceType:
+    Type: String
+    Default: ml.m5.2xlarge
+    Description: >-
+      Instance type backing the JupyterLab space. The notebook only orchestrates
+      Kubernetes resources, so a CPU instance is enough; the training itself runs
+      on the HyperPod accelerated instance group.
+
+  StudioSpaceEbsVolumeSizeInGB:
+    Type: Number
+    Default: 100
+    MinValue: 5
+    MaxValue: 1024
+    Description: EBS volume size for the JupyterLab space, in GiB.
+
+  GitRepositoryUrl:
+    Type: String
+    AllowedPattern: 'https://.+'
+    Description: >-
+      HTTPS URL of the Git repository holding the on-policy distillation notebook
+      and code. Cloned into the JupyterLab space on every app start by the Studio
+      lifecycle configuration, and registered as a code repository in JupyterLab.
+
+  GitRepositoryBranch:
+    Type: String
+    Default: ''
+    Description: >-
+      Branch to check out. Leave blank to clone the repository's default branch.
+
+  HelmRepoUrl:
+    Type: String
+    Default: https://github.com/aws/sagemaker-hyperpod-cli.git
+    Description: Git repository holding the HyperPod Helm chart.
+
+  HelmRepoPath:
+    Type: String
+    Default: helm_chart/HyperPodHelmChart
+    Description: Path to the HyperPod Helm chart inside the repository.
+
+  HelmRelease:
+    Type: String
+    Default: dependencies
+    Description: Helm release name for the HyperPod dependencies.
+
+  HelmNamespace:
+    Type: String
+    Default: kube-system
+    Description: Namespace the HyperPod dependencies are installed into.
+
+  HelmOperators:
+    Type: String
+    Default: >-
+      mlflow.enabled=true,trainingOperators.enabled=true,cluster-role-and-bindings.enabled=true,namespaced-role-and-bindings.enable=true,nvidia-device-plugin.devicePlugin.enabled=true,neuron-device-plugin.devicePlugin.enabled=true,aws-efa-k8s-device-plugin.devicePlugin.enabled=true,mpi-operator.enabled=true,health-monitoring-agent.enabled=true,deep-health-check.enabled=true,job-auto-restart.enabled=true,hyperpod-patching.enabled=true
+    Description: Comma-separated Helm --set values for the HyperPod dependency chart.
+
+Conditions:
+
+  UseGrafana: !Equals [!Ref CreateGrafanaWorkspace, 'true']
+  UseStudio: !Equals [!Ref CreateStudioDomain, 'true']
+  UseStudioSpace: !And
+    - !Equals [!Ref CreateStudioDomain, 'true']
+    - !Equals [!Ref CreateStudioSpace, 'true']
+  HasGitBranch: !Not [!Equals [!Ref GitRepositoryBranch, '']]
+  HasAdminPrincipal: !Not [!Equals [!Ref AdminPrincipalArn, '']]
+  HasKubernetesVersion: !Not [!Equals [!Ref KubernetesVersion, '']]
+  UseLatestKubernetesVersion: !Equals [!Ref KubernetesVersion, '']
+  PrimaryAzIs0: !Equals [!Ref PrimaryAvailabilityZoneIndex, 0]
+  PrimaryAzIs1: !Equals [!Ref PrimaryAvailabilityZoneIndex, 1]
+  PrimaryAzIs2: !Equals [!Ref PrimaryAvailabilityZoneIndex, 2]
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # Networking
+  #
+  # Primary CIDR (10.192.0.0/16 by default) carries the public subnets and the
+  # EKS control-plane subnets as /24s. Each HyperPod node subnet gets a whole
+  # secondary /16 so that large training fleets, EFA interfaces and pod ENIs
+  # never exhaust the address space.
+  # ---------------------------------------------------------------------------
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - {Key: Name, Value: !Sub '${ResourceNamePrefix}-vpc'}
+
+  HyperPodCidr1:
+    Type: AWS::EC2::VPCCidrBlock
+    Properties: {VpcId: !Ref VPC, CidrBlock: 10.1.0.0/16}
+  HyperPodCidr2:
+    Type: AWS::EC2::VPCCidrBlock
+    Properties: {VpcId: !Ref VPC, CidrBlock: 10.2.0.0/16}
+  HyperPodCidr3:
+    Type: AWS::EC2::VPCCidrBlock
+    Properties: {VpcId: !Ref VPC, CidrBlock: 10.3.0.0/16}
+  HyperPodCidr4:
+    Type: AWS::EC2::VPCCidrBlock
+    Properties: {VpcId: !Ref VPC, CidrBlock: 10.4.0.0/16}
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - {Key: Name, Value: !Sub '${ResourceNamePrefix}-igw'}
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - {Key: Name, Value: !Sub '${ResourceNamePrefix}-public-rt'}
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCIDR, 16, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - {Key: Name, Value: !Sub '${ResourceNamePrefix}-public-1'}
+        - {Key: kubernetes.io/role/elb, Value: '1'}
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCIDR, 16, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - {Key: Name, Value: !Sub '${ResourceNamePrefix}-public-2'}
+        - {Key: kubernetes.io/role/elb, Value: '1'}
+  PublicSubnet3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [2, !GetAZs '']
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCIDR, 16, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - {Key: Name, Value: !Sub '${ResourceNamePrefix}-public-3'}
+        - {Key: kubernetes.io/role/elb, Value: '1'}
+  PublicSubnet4:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [3, !GetAZs '']
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCIDR, 16, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - {Key: Name, Value: !Sub '${ResourceNamePrefix}-public-4'}
+        - {Key: kubernetes.io/role/elb, Value: '1'}
+
+  PublicSubnet1RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {RouteTableId: !Ref PublicRouteTable, SubnetId: !Ref PublicSubnet1}
+  PublicSubnet2RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {RouteTableId: !Ref PublicRouteTable, SubnetId: !Ref PublicSubnet2}
+  PublicSubnet3RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {RouteTableId: !Ref PublicRouteTable, SubnetId: !Ref PublicSubnet3}
+  PublicSubnet4RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {RouteTableId: !Ref PublicRouteTable, SubnetId: !Ref PublicSubnet4}
+
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - {Key: Name, Value: !Sub '${ResourceNamePrefix}-nat-eip'}
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - {Key: Name, Value: !Sub '${ResourceNamePrefix}-nat'}
+
+  # EKS control-plane subnets: private, no internet route (they only need to
+  # reach the VPC and S3 via the gateway endpoint).
+  EksSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [4, !Cidr [!Ref VpcCIDR, 16, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - {Key: Name, Value: !Sub '${ResourceNamePrefix}-eks-private-1'}
+        - {Key: kubernetes.io/role/internal-elb, Value: '1'}
+  EksSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [5, !Cidr [!Ref VpcCIDR, 16, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - {Key: Name, Value: !Sub '${ResourceNamePrefix}-eks-private-2'}
+        - {Key: kubernetes.io/role/internal-elb, Value: '1'}
+  EksSubnet3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [2, !GetAZs '']
+      CidrBlock: !Select [6, !Cidr [!Ref VpcCIDR, 16, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - {Key: Name, Value: !Sub '${ResourceNamePrefix}-eks-private-3'}
+        - {Key: kubernetes.io/role/internal-elb, Value: '1'}
+  EksSubnet4:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [3, !GetAZs '']
+      CidrBlock: !Select [7, !Cidr [!Ref VpcCIDR, 16, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - {Key: Name, Value: !Sub '${ResourceNamePrefix}-eks-private-4'}
+        - {Key: kubernetes.io/role/internal-elb, Value: '1'}
+
+  EksRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - {Key: Name, Value: !Sub '${ResourceNamePrefix}-eks-private-rt'}
+
+  EksSubnet1RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {RouteTableId: !Ref EksRouteTable, SubnetId: !Ref EksSubnet1}
+  EksSubnet2RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {RouteTableId: !Ref EksRouteTable, SubnetId: !Ref EksSubnet2}
+  EksSubnet3RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {RouteTableId: !Ref EksRouteTable, SubnetId: !Ref EksSubnet3}
+  EksSubnet4RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {RouteTableId: !Ref EksRouteTable, SubnetId: !Ref EksSubnet4}
+
+  # HyperPod node subnets: one full secondary /16 per AZ, NAT egress.
+  HyperPodSubnet1:
+    Type: AWS::EC2::Subnet
+    DependsOn: HyperPodCidr1
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.1.0.0/16
+      MapPublicIpOnLaunch: false
+      Tags:
+        - {Key: Name, Value: !Sub '${ResourceNamePrefix}-hyperpod-1'}
+  HyperPodSubnet2:
+    Type: AWS::EC2::Subnet
+    DependsOn: HyperPodCidr2
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.2.0.0/16
+      MapPublicIpOnLaunch: false
+      Tags:
+        - {Key: Name, Value: !Sub '${ResourceNamePrefix}-hyperpod-2'}
+  HyperPodSubnet3:
+    Type: AWS::EC2::Subnet
+    DependsOn: HyperPodCidr3
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [2, !GetAZs '']
+      CidrBlock: 10.3.0.0/16
+      MapPublicIpOnLaunch: false
+      Tags:
+        - {Key: Name, Value: !Sub '${ResourceNamePrefix}-hyperpod-3'}
+  HyperPodSubnet4:
+    Type: AWS::EC2::Subnet
+    DependsOn: HyperPodCidr4
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [3, !GetAZs '']
+      CidrBlock: 10.4.0.0/16
+      MapPublicIpOnLaunch: false
+      Tags:
+        - {Key: Name, Value: !Sub '${ResourceNamePrefix}-hyperpod-4'}
+
+  HyperPodRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - {Key: Name, Value: !Sub '${ResourceNamePrefix}-hyperpod-rt'}
+
+  HyperPodDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref HyperPodRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  HyperPodSubnet1RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {RouteTableId: !Ref HyperPodRouteTable, SubnetId: !Ref HyperPodSubnet1}
+  HyperPodSubnet2RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {RouteTableId: !Ref HyperPodRouteTable, SubnetId: !Ref HyperPodSubnet2}
+  HyperPodSubnet3RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {RouteTableId: !Ref HyperPodRouteTable, SubnetId: !Ref HyperPodSubnet3}
+  HyperPodSubnet4RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {RouteTableId: !Ref HyperPodRouteTable, SubnetId: !Ref HyperPodSubnet4}
+
+  ClusterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ResourceNamePrefix}-sg'
+      GroupDescription: >-
+        Shared security group for the EKS control plane, HyperPod nodes, FSx for
+        Lustre and the observability VPC endpoints.
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - {Key: Name, Value: !Sub '${ResourceNamePrefix}-sg'}
+
+  IntraSgIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Allow all traffic within the security group
+      GroupId: !Ref ClusterSecurityGroup
+      SourceSecurityGroupId: !Ref ClusterSecurityGroup
+      IpProtocol: '-1'
+
+  FsxLustreIngress988:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Lustre traffic between FSx file servers and clients
+      GroupId: !Ref ClusterSecurityGroup
+      SourceSecurityGroupId: !Ref ClusterSecurityGroup
+      IpProtocol: tcp
+      FromPort: 988
+      ToPort: 988
+
+  FsxLustreIngress1018:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Lustre traffic between FSx file servers and clients
+      GroupId: !Ref ClusterSecurityGroup
+      SourceSecurityGroupId: !Ref ClusterSecurityGroup
+      IpProtocol: tcp
+      FromPort: 1018
+      ToPort: 1023
+
+  # S3 gateway endpoint keeps checkpoint and dataset traffic off the NAT gateway.
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      VpcEndpointType: Gateway
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      RouteTableIds:
+        - !Ref HyperPodRouteTable
+        - !Ref EksRouteTable
+
+  PrometheusVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.aps-workspaces'
+      SecurityGroupIds: [!Ref ClusterSecurityGroup]
+      SubnetIds: [!Ref HyperPodSubnet1, !Ref HyperPodSubnet2, !Ref HyperPodSubnet3, !Ref HyperPodSubnet4]
+      Tags:
+        - {Key: Name, Value: !Sub '${ResourceNamePrefix}-aps-vpce'}
+
+  GrafanaVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: UseGrafana
+    Properties:
+      VpcId: !Ref VPC
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.grafana-workspace'
+      SecurityGroupIds: [!Ref ClusterSecurityGroup]
+      SubnetIds: [!Ref HyperPodSubnet1, !Ref HyperPodSubnet2, !Ref HyperPodSubnet3, !Ref HyperPodSubnet4]
+      Tags:
+        - {Key: Name, Value: !Sub '${ResourceNamePrefix}-grafana-vpce'}
+
+  # ---------------------------------------------------------------------------
+  # S3: shared bucket for lifecycle scripts, datasets, checkpoints and Studio
+  # artifacts, plus a separate access-log bucket.
+  # ---------------------------------------------------------------------------
+
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${ResourceNamePrefix}-${AWS::AccountId}-logs'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyUnsecuredTransport
+            Effect: Deny
+            Principal: {AWS: '*'}
+            Action: 's3:*'
+            Resource:
+              - !GetAtt AccessLogsBucket.Arn
+              - !Sub '${AccessLogsBucket.Arn}/*'
+            Condition:
+              Bool: {'aws:SecureTransport': 'false'}
+          - Sid: AllowS3ServerAccessLogging
+            Effect: Allow
+            Principal: {Service: logging.s3.amazonaws.com}
+            Action: 's3:PutObject'
+            Resource: !Sub '${AccessLogsBucket.Arn}/*'
+            Condition:
+              StringEquals: {'aws:SourceAccount': !Ref 'AWS::AccountId'}
+
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${ResourceNamePrefix}-${AWS::AccountId}-bucket'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: bucket-logs/
+      Tags:
+        - {Key: Name, Value: !Sub '${ResourceNamePrefix}-bucket'}
+
+  DataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyUnsecuredTransport
+            Effect: Deny
+            Principal: {AWS: '*'}
+            Action: 's3:*'
+            Resource:
+              - !GetAtt DataBucket.Arn
+              - !Sub '${DataBucket.Arn}/*'
+            Condition:
+              Bool: {'aws:SecureTransport': 'false'}
+          # Explicit allow for the three consumers, so the sample documents who
+          # is expected to touch this bucket. IAM-side grants come from
+          # BucketAccessPolicy below.
+          - Sid: AllowClusterAndStudioPrincipals
+            Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt HyperPodExecutionRole.Arn
+                - !GetAtt S3CsiDriverRole.Arn
+                - !If [UseStudio, !GetAtt StudioExecutionRole.Arn, !Ref 'AWS::NoValue']
+            Action:
+              - 's3:ListBucket'
+              - 's3:GetBucketLocation'
+              - 's3:GetObject'
+              - 's3:PutObject'
+              - 's3:DeleteObject'
+              - 's3:AbortMultipartUpload'
+              - 's3:ListBucketMultipartUploads'
+              - 's3:ListMultipartUploadParts'
+            Resource:
+              - !GetAtt DataBucket.Arn
+              - !Sub '${DataBucket.Arn}/*'
+
+  # Single managed policy granting everything Mountpoint for S3, the HyperPod
+  # nodes and SageMaker Studio need on this bucket.
+  BucketAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${ResourceNamePrefix}-bucket-access'
+      Description: Read/write access to the HyperPod shared S3 bucket (Mountpoint-S3 compatible).
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: MountpointBucketAccess
+            Effect: Allow
+            Action:
+              - 's3:ListBucket'
+              - 's3:GetBucketLocation'
+            Resource: !GetAtt DataBucket.Arn
+          - Sid: MountpointObjectAccess
+            Effect: Allow
+            Action:
+              - 's3:GetObject'
+              - 's3:PutObject'
+              - 's3:DeleteObject'
+              - 's3:AbortMultipartUpload'
+              - 's3:ListMultipartUploadParts'
+            Resource: !Sub '${DataBucket.Arn}/*'
+
+  # ---------------------------------------------------------------------------
+  # Lifecycle script: HyperPod requires an on-create script in S3. For
+  # EKS-orchestrated clusters the heavy lifting is done by the Helm chart, so
+  # this script is intentionally close to a no-op.
+  # ---------------------------------------------------------------------------
+
+  LifecycleScriptUploadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: WriteLifecycleScript
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['s3:PutObject', 's3:DeleteObject']
+                Resource: !Sub '${DataBucket.Arn}/*'
+
+  LifecycleScriptUploadFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Writes the HyperPod on_create.sh lifecycle script into the shared bucket.
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 60
+      Role: !GetAtt LifecycleScriptUploadRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          SCRIPT = """#!/bin/bash
+          set -euxo pipefail
+          # HyperPod on-create lifecycle script (EKS orchestration).
+          # Cluster software (device plugins, health monitoring agent, training
+          # operators) is installed on the EKS side via the HyperPod Helm chart,
+          # so nothing instance-local is required here. Add node-level setup
+          # (extra packages, mounts, tuning) below.
+          echo "on_create.sh completed on $(hostname)"
+          """
+
+          def handler(event, context):
+              props = event.get("ResourceProperties", {})
+              bucket = props.get("Bucket")
+              key = props.get("Key", "on_create.sh")
+              s3 = boto3.client("s3")
+              try:
+                  if event["RequestType"] == "Delete":
+                      s3.delete_object(Bucket=bucket, Key=key)
+                  else:
+                      body = "\n".join(line.strip() for line in SCRIPT.strip().splitlines())
+                      s3.put_object(Bucket=bucket, Key=key, Body=body.encode(),
+                                    ContentType="text/x-shellscript")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                                   {"S3Uri": "s3://%s/%s" % (bucket, key)})
+              except Exception as exc:  # noqa: BLE001
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(exc)})
+
+  LifecycleScript:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt LifecycleScriptUploadFunction.Arn
+      Bucket: !Ref DataBucket
+      Key: on_create.sh
+
+  # ---------------------------------------------------------------------------
+  # EKS cluster
+  # ---------------------------------------------------------------------------
+
+  # Resolves the newest Kubernetes version in EKS standard support when the
+  # KubernetesVersion parameter is left empty. The lookup only re-runs when its
+  # properties change, so stack updates never trigger an implicit upgrade.
+  EksVersionLookupRole:
+    Type: AWS::IAM::Role
+    Condition: UseLatestKubernetesVersion
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: DescribeEksVersions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'eks:DescribeClusterVersions'
+                Resource: '*'
+
+  EksVersionLookupFunction:
+    Type: AWS::Lambda::Function
+    Condition: UseLatestKubernetesVersion
+    Properties:
+      Description: Returns the latest Kubernetes version in EKS standard support.
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 60
+      Role: !GetAtt EksVersionLookupRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              try:
+                  if event["RequestType"] == "Delete":
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  eks = boto3.client("eks")
+                  versions, token = [], None
+                  while True:
+                      kwargs = {"versionStatus": "STANDARD_SUPPORT"}
+                      if token:
+                          kwargs["nextToken"] = token
+                      resp = eks.describe_cluster_versions(**kwargs)
+                      versions += [v["clusterVersion"] for v in resp.get("clusterVersions", [])]
+                      token = resp.get("nextToken")
+                      if not token:
+                          break
+                  if not versions:
+                      raise RuntimeError("No EKS versions in standard support")
+                  latest = max(versions, key=lambda v: tuple(int(x) for x in v.split(".")))
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                                   {"Version": latest}, physicalResourceId=latest)
+              except Exception as exc:  # noqa: BLE001
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(exc)})
+
+  EksVersionLookup:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: UseLatestKubernetesVersion
+    Properties:
+      ServiceToken: !GetAtt EksVersionLookupFunction.Arn
+
+  EksClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourceNamePrefix}-eks-cluster-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: eks.amazonaws.com}
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKSClusterPolicy'
+
+  EksCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Sub '${ResourceNamePrefix}-eks'
+      Version: !If [HasKubernetesVersion, !Ref KubernetesVersion, !GetAtt EksVersionLookup.Version]
+      RoleArn: !GetAtt EksClusterRole.Arn
+      AccessConfig:
+        AuthenticationMode: API_AND_CONFIG_MAP
+        BootstrapClusterCreatorAdminPermissions: true
+      ResourcesVpcConfig:
+        SecurityGroupIds: [!Ref ClusterSecurityGroup]
+        SubnetIds: [!Ref EksSubnet1, !Ref EksSubnet2, !Ref EksSubnet3, !Ref EksSubnet4]
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: true
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - {Type: api}
+            - {Type: audit}
+            - {Type: authenticator}
+            - {Type: controllerManager}
+            - {Type: scheduler}
+      Tags:
+        - {Key: Name, Value: !Sub '${ResourceNamePrefix}-eks'}
+
+  AdminAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Condition: HasAdminPrincipal
+    Properties:
+      ClusterName: !Ref EksCluster
+      PrincipalArn: !Ref AdminPrincipalArn
+      AccessPolicies:
+        - PolicyArn: !Sub 'arn:${AWS::Partition}:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy'
+          AccessScope: {Type: cluster}
+
+  # --- Core add-ons ----------------------------------------------------------
+
+  VpcCniAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref EksCluster
+      AddonName: vpc-cni
+      ResolveConflicts: OVERWRITE
+
+  KubeProxyAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref EksCluster
+      AddonName: kube-proxy
+      ResolveConflicts: OVERWRITE
+
+  CoreDnsAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref EksCluster
+      AddonName: coredns
+      ResolveConflicts: OVERWRITE
+
+  PodIdentityAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref EksCluster
+      AddonName: eks-pod-identity-agent
+      ResolveConflicts: OVERWRITE
+
+  MetricsServerAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: [CoreDnsAddon, PodIdentityAddon]
+    Properties:
+      ClusterName: !Ref EksCluster
+      AddonName: metrics-server
+      ResolveConflicts: OVERWRITE
+
+  CertManagerAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: MetricsServerAddon
+    Properties:
+      ClusterName: !Ref EksCluster
+      AddonName: cert-manager
+      ResolveConflicts: OVERWRITE
+
+  # --- Storage drivers (EKS Pod Identity, no OIDC provider needed) -----------
+
+  EbsCsiDriverRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourceNamePrefix}-ebs-csi-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: pods.eks.amazonaws.com}
+            Action: ['sts:AssumeRole', 'sts:TagSession']
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy'
+
+  EbsCsiAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: PodIdentityAddon
+    Properties:
+      ClusterName: !Ref EksCluster
+      AddonName: aws-ebs-csi-driver
+      ResolveConflicts: OVERWRITE
+      PodIdentityAssociations:
+        - ServiceAccount: ebs-csi-controller-sa
+          RoleArn: !GetAtt EbsCsiDriverRole.Arn
+
+  FsxCsiDriverRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourceNamePrefix}-fsx-csi-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: pods.eks.amazonaws.com}
+            Action: ['sts:AssumeRole', 'sts:TagSession']
+      Policies:
+        - PolicyName: FsxCsiDriverAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'fsx:DescribeFileSystems'
+                  - 'fsx:CreateFileSystem'
+                  - 'fsx:DeleteFileSystem'
+                  - 'fsx:UpdateFileSystem'
+                  - 'fsx:TagResource'
+                  - 'fsx:ListTagsForResource'
+                  - 'fsx:CreateDataRepositoryTask'
+                  - 'fsx:DescribeDataRepositoryTasks'
+                Resource: '*'
+              - Effect: Allow
+                Action: 'iam:CreateServiceLinkedRole'
+                Resource: '*'
+                Condition:
+                  StringLike: {'iam:AWSServiceName': 'fsx.amazonaws.com'}
+
+  FsxCsiAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: PodIdentityAddon
+    Properties:
+      ClusterName: !Ref EksCluster
+      AddonName: aws-fsx-csi-driver
+      ResolveConflicts: OVERWRITE
+      PodIdentityAssociations:
+        - ServiceAccount: fsx-csi-controller-sa
+          RoleArn: !GetAtt FsxCsiDriverRole.Arn
+
+  # Mountpoint for Amazon S3 CSI driver: this is what lets pods on the EKS /
+  # HyperPod side mount the shared bucket as a POSIX-ish file system.
+  S3CsiDriverRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourceNamePrefix}-s3-csi-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: pods.eks.amazonaws.com}
+            Action: ['sts:AssumeRole', 'sts:TagSession']
+      ManagedPolicyArns:
+        - !Ref BucketAccessPolicy
+
+  S3CsiAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: PodIdentityAddon
+    Properties:
+      ClusterName: !Ref EksCluster
+      AddonName: aws-mountpoint-s3-csi-driver
+      ResolveConflicts: OVERWRITE
+      PodIdentityAssociations:
+        - ServiceAccount: s3-csi-driver-sa
+          RoleArn: !GetAtt S3CsiDriverRole.Arn
+
+  # ---------------------------------------------------------------------------
+  # FSx for Lustre: high-throughput shared scratch for datasets, teacher logits
+  # and checkpoints. Placed in the same AZ as the accelerated instance group.
+  # ---------------------------------------------------------------------------
+
+  FsxFileSystem:
+    Type: AWS::FSx::FileSystem
+    DeletionPolicy: Delete
+    Properties:
+      FileSystemType: LUSTRE
+      FileSystemTypeVersion: !Ref FsxFileSystemTypeVersion
+      StorageType: SSD
+      StorageCapacity: !Ref FsxStorageCapacity
+      SecurityGroupIds: [!Ref ClusterSecurityGroup]
+      SubnetIds:
+        - !If
+          - PrimaryAzIs0
+          - !Ref HyperPodSubnet1
+          - !If
+            - PrimaryAzIs1
+            - !Ref HyperPodSubnet2
+            - !If [PrimaryAzIs2, !Ref HyperPodSubnet3, !Ref HyperPodSubnet4]
+      LustreConfiguration:
+        DeploymentType: !Ref FsxDeploymentType
+        PerUnitStorageThroughput: !Ref FsxPerUnitStorageThroughput
+        DataCompressionType: !Ref FsxDataCompressionType
+        MetadataConfiguration: {Mode: AUTOMATIC}
+      Tags:
+        - {Key: Name, Value: !Sub '${ResourceNamePrefix}-fsx-lustre'}
+
+  # ---------------------------------------------------------------------------
+  # Observability: Amazon Managed Prometheus for metrics, optional Amazon
+  # Managed Grafana for the HyperPod dashboards, and the HyperPod observability
+  # add-on that scrapes training / node / GPU metrics into AMP.
+  # ---------------------------------------------------------------------------
+
+  PrometheusWorkspace:
+    Type: AWS::APS::Workspace
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Alias: !Sub '${ResourceNamePrefix}-amp'
+      Tags:
+        - {Key: SageMaker, Value: 'true'}
+
+  ObservabilityAddonRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourceNamePrefix}-observability-role'
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEksAuthToAssumeRoleForPodIdentity
+            Effect: Allow
+            Principal: {Service: pods.eks.amazonaws.com}
+            Action: ['sts:AssumeRole', 'sts:TagSession']
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+                'aws:SourceArn': !GetAtt EksCluster.Arn
+      Policies:
+        - PolicyName: HyperPodObservability
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: PrometheusRemoteWrite
+                Effect: Allow
+                Action: 'aps:RemoteWrite'
+                Resource: !GetAtt PrometheusWorkspace.Arn
+              - Sid: CloudWatchLogsAccess
+                Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:DescribeLogGroups'
+                  - 'logs:DescribeLogStreams'
+                  - 'logs:PutLogEvents'
+                  - 'logs:GetLogEvents'
+                  - 'logs:FilterLogEvents'
+                  - 'logs:GetLogRecord'
+                  - 'logs:StartQuery'
+                  - 'logs:StopQuery'
+                  - 'logs:GetQueryResults'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/sagemaker/Clusters/*'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/sagemaker/Clusters/*:log-stream:*'
+
+  GrafanaWorkspaceRole:
+    Type: AWS::IAM::Role
+    Condition: UseGrafana
+    Properties:
+      RoleName: !Sub '${ResourceNamePrefix}-grafana-role'
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: GrafanaAssumeRole
+            Effect: Allow
+            Principal: {Service: grafana.amazonaws.com}
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals: {'aws:SourceAccount': !Ref 'AWS::AccountId'}
+      Policies:
+        - PolicyName: GrafanaDataSourceAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowReadingMetricsFromCloudWatch
+                Effect: Allow
+                Action:
+                  - 'cloudwatch:ListMetrics'
+                  - 'cloudwatch:GetMetricStatistics'
+                  - 'cloudwatch:GetMetricData'
+                  - 'cloudwatch:DescribeAlarmsForMetric'
+                  - 'cloudwatch:GetInsightRuleReport'
+                Resource: '*'
+              - Sid: AllowReadingAlarmsFromCloudWatch
+                Effect: Allow
+                Action: ['cloudwatch:DescribeAlarmHistory', 'cloudwatch:DescribeAlarms']
+                Resource: !Sub 'arn:${AWS::Partition}:cloudwatch:*:*:alarm:*'
+              - Sid: AllowReadingLogsFromCloudWatch
+                Effect: Allow
+                Action: ['logs:DescribeLogGroups', 'logs:StopQuery', 'logs:GetLogEvents']
+                Resource: '*'
+              - Sid: AllowQueryLogsFromCloudWatch
+                Effect: Allow
+                Action:
+                  - 'logs:GetLogGroupFields'
+                  - 'logs:StartQuery'
+                  - 'logs:GetQueryResults'
+                  - 'logs:GetLogEvents'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:*:*:log-group:*'
+                  - !Sub 'arn:${AWS::Partition}:logs:*:*:log-group:*:log-stream:*'
+              - Sid: AllowReadingTagsInstancesRegionsFromEC2
+                Effect: Allow
+                Action: ['ec2:DescribeTags', 'ec2:DescribeInstances', 'ec2:DescribeRegions']
+                Resource: '*'
+              - Sid: AllowReadingResourcesForTags
+                Effect: Allow
+                Action: 'tag:GetResources'
+                Resource: '*'
+              - Sid: AllowListWorkspacesFromPrometheus
+                Effect: Allow
+                Action: 'aps:ListWorkspaces'
+                Resource: '*'
+              - Sid: AllowReadingMetricsFromPrometheus
+                Effect: Allow
+                Action:
+                  - 'aps:DescribeWorkspace'
+                  - 'aps:QueryMetrics'
+                  - 'aps:GetLabels'
+                  - 'aps:GetSeries'
+                  - 'aps:GetMetricMetadata'
+                Resource: !Sub 'arn:${AWS::Partition}:aps:*:*:workspace/*'
+              - Sid: AllowReadingAlertsFromPrometheus
+                Effect: Allow
+                Action:
+                  - 'aps:ListRules'
+                  - 'aps:ListAlertManagerSilences'
+                  - 'aps:ListAlertManagerAlerts'
+                  - 'aps:GetAlertManagerStatus'
+                  - 'aps:ListAlertManagerAlertGroups'
+                  - 'aps:PutAlertManagerSilences'
+                  - 'aps:DeleteAlertManagerSilence'
+                Resource: !Sub 'arn:${AWS::Partition}:aps:*:*:workspace/*'
+
+  GrafanaWorkspace:
+    Type: AWS::Grafana::Workspace
+    Condition: UseGrafana
+    Properties:
+      Name: !Sub '${ResourceNamePrefix}-grafana'
+      Description: HyperPod on-policy distillation dashboards
+      AccountAccessType: CURRENT_ACCOUNT
+      AuthenticationProviders: [AWS_SSO]
+      PermissionType: SERVICE_MANAGED
+      RoleArn: !GetAtt GrafanaWorkspaceRole.Arn
+      DataSources: [PROMETHEUS, CLOUDWATCH]
+      GrafanaVersion: '10.4'
+
+  CloudWatchObservabilityAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: [PodIdentityAddon, CertManagerAddon]
+    Properties:
+      ClusterName: !Ref EksCluster
+      AddonName: amazon-cloudwatch-observability
+      ResolveConflicts: OVERWRITE
+
+  # ---------------------------------------------------------------------------
+  # Cluster dependencies (Helm) + Kubernetes storage objects.
+  #
+  # HyperPod requires a set of in-cluster components (device plugins, EFA plugin,
+  # health monitoring agent, deep health check, job auto-restart, training and
+  # MPI operators) before nodes can join. They ship as a Helm chart in the
+  # public sagemaker-hyperpod-cli repo, so a CodeBuild project installs them and
+  # then applies the FSx and S3 PersistentVolumes.
+  # ---------------------------------------------------------------------------
+
+  BootstrapProjectRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourceNamePrefix}-bootstrap-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: codebuild.amazonaws.com}
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: BootstrapAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents']
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*'
+              - Effect: Allow
+                Action: ['eks:DescribeCluster', 'eks:ListAddons', 'eks:DescribeAddon']
+                Resource: !GetAtt EksCluster.Arn
+
+  BootstrapAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref EksCluster
+      PrincipalArn: !GetAtt BootstrapProjectRole.Arn
+      AccessPolicies:
+        - PolicyArn: !Sub 'arn:${AWS::Partition}:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy'
+          AccessScope: {Type: cluster}
+
+  BootstrapProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ResourceNamePrefix}-bootstrap'
+      Description: Installs HyperPod Helm dependencies and Kubernetes storage objects.
+      ServiceRole: !GetAtt BootstrapProjectRole.Arn
+      Artifacts: {Type: NO_ARTIFACTS}
+      TimeoutInMinutes: 30
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-x86_64-standard:5.0
+        EnvironmentVariables:
+          - {Name: PHASE, Value: helm}
+          - {Name: EKS_CLUSTER_NAME, Value: !Ref EksCluster}
+          - Name: K8S_MINOR
+            Value: !If [HasKubernetesVersion, !Ref KubernetesVersion, !GetAtt EksVersionLookup.Version]
+          - {Name: HELM_REPO_URL, Value: !Ref HelmRepoUrl}
+          - {Name: HELM_CHART_PATH, Value: !Ref HelmRepoPath}
+          - {Name: HELM_RELEASE, Value: !Ref HelmRelease}
+          - {Name: HELM_NAMESPACE, Value: !Ref HelmNamespace}
+          - {Name: HELM_OPERATORS, Value: !Ref HelmOperators}
+          - {Name: FSX_FS_ID, Value: !Ref FsxFileSystem}
+          - {Name: FSX_DNS_NAME, Value: !GetAtt FsxFileSystem.DNSName}
+          - {Name: FSX_MOUNT_NAME, Value: !GetAtt FsxFileSystem.LustreMountName}
+          - {Name: FSX_CAPACITY_GI, Value: !Ref FsxStorageCapacity}
+          - {Name: S3_BUCKET_NAME, Value: !Ref DataBucket}
+          # Who may attach the opd-workspace service account to a JupyterLab space (the spaces
+          # add-on's admission webhook checks this annotation): any role session in this account.
+          # Attaching it still requires RBAC on workspaces in `default`. Narrow it to one role with
+          # e.g. arn:aws:sts::<account>:assumed-role/<role>/*.
+          - {Name: SPACE_USER_PATTERNS, Value: !Sub 'arn:${AWS::Partition}:sts::${AWS::AccountId}:assumed-role/*'}
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - set -euo pipefail
+                - curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable-${K8S_MINOR}.txt)/bin/linux/amd64/kubectl"
+                - chmod +x /usr/local/bin/kubectl
+                - curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+                - aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
+                - kubectl version
+            build:
+              commands:
+                - |
+                  set -euo pipefail
+                  if [ "$PHASE" = "helm" ]; then
+                    echo "=== Installing HyperPod cluster dependencies ==="
+                    rm -rf /tmp/hpcli
+                    git clone --depth 1 "$HELM_REPO_URL" /tmp/hpcli
+                    cd "/tmp/hpcli/$HELM_CHART_PATH"
+                    helm dependency update .
+                    SET_ARGS=""
+                    IFS=','
+                    for kv in $HELM_OPERATORS; do
+                      [ -n "$kv" ] && SET_ARGS="$SET_ARGS --set $kv"
+                    done
+                    unset IFS
+                    helm upgrade --install "$HELM_RELEASE" . \
+                      --namespace "$HELM_NAMESPACE" --create-namespace \
+                      $SET_ARGS --timeout 20m
+                    helm list -n "$HELM_NAMESPACE"
+                  elif [ "$PHASE" = "storage" ]; then
+                    echo "=== Applying FSx for Lustre PersistentVolume ==="
+                    cat <<EOF | kubectl apply -f -
+                  apiVersion: v1
+                  kind: PersistentVolume
+                  metadata:
+                    name: fsx-pv
+                  spec:
+                    capacity:
+                      storage: ${FSX_CAPACITY_GI}Gi
+                    volumeMode: Filesystem
+                    accessModes:
+                      - ReadWriteMany
+                    mountOptions:
+                      - flock
+                    persistentVolumeReclaimPolicy: Retain
+                    storageClassName: ""
+                    csi:
+                      driver: fsx.csi.aws.com
+                      volumeHandle: ${FSX_FS_ID}
+                      volumeAttributes:
+                        dnsname: ${FSX_DNS_NAME}
+                        mountname: ${FSX_MOUNT_NAME}
+                  ---
+                  apiVersion: v1
+                  kind: PersistentVolumeClaim
+                  metadata:
+                    name: fsx-claim
+                    namespace: default
+                  spec:
+                    accessModes:
+                      - ReadWriteMany
+                    storageClassName: ""
+                    volumeName: fsx-pv
+                    resources:
+                      requests:
+                        storage: ${FSX_CAPACITY_GI}Gi
+                  EOF
+                    echo "=== Applying Mountpoint-S3 PersistentVolume ==="
+                    cat <<EOF | kubectl apply -f -
+                  apiVersion: v1
+                  kind: PersistentVolume
+                  metadata:
+                    name: s3-pv
+                  spec:
+                    capacity:
+                      storage: 1200Gi
+                    accessModes:
+                      - ReadWriteMany
+                    mountOptions:
+                      - allow-delete
+                      - allow-other
+                      - region ${AWS_REGION}
+                    persistentVolumeReclaimPolicy: Retain
+                    storageClassName: ""
+                    csi:
+                      driver: s3.csi.aws.com
+                      volumeHandle: s3-csi-${S3_BUCKET_NAME}
+                      volumeAttributes:
+                        bucketName: ${S3_BUCKET_NAME}
+                  ---
+                  apiVersion: v1
+                  kind: PersistentVolumeClaim
+                  metadata:
+                    name: s3-claim
+                    namespace: default
+                  spec:
+                    accessModes:
+                      - ReadWriteMany
+                    storageClassName: ""
+                    volumeName: s3-pv
+                    resources:
+                      requests:
+                        storage: 1200Gi
+                  EOF
+                    echo "=== Service account for HyperPod-hosted JupyterLab spaces ==="
+                    cat <<EOF | kubectl apply -f -
+                  apiVersion: v1
+                  kind: ServiceAccount
+                  metadata:
+                    name: opd-workspace
+                    namespace: default
+                    annotations:
+                      workspace.jupyter.org/service-account-user-patterns: '["${SPACE_USER_PATTERNS}"]'
+                  EOF
+                    kubectl get pv,pvc -A
+                  else
+                    echo "Unknown PHASE: $PHASE" >&2
+                    exit 1
+                  fi
+
+  BootstrapRunnerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: RunBootstrapBuild
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['codebuild:StartBuild', 'codebuild:BatchGetBuilds']
+                Resource: !GetAtt BootstrapProject.Arn
+
+  BootstrapRunnerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Runs a phase of the HyperPod bootstrap CodeBuild project and waits for it.
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 900
+      Role: !GetAtt BootstrapRunnerRole.Arn
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref BootstrapProject
+      Code:
+        ZipFile: |
+          import os
+          import time
+
+          import boto3
+          import cfnresponse
+
+          TERMINAL = ("SUCCEEDED", "FAILED", "FAULT", "TIMED_OUT", "STOPPED")
+
+
+          def handler(event, context):
+              # Teardown is handled by deleting the underlying AWS resources; the
+              # in-cluster objects go away with the EKS cluster.
+              if event["RequestType"] == "Delete":
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+
+              phase = event["ResourceProperties"]["Phase"]
+              client = boto3.client("codebuild")
+              try:
+                  build = client.start_build(
+                      projectName=os.environ["PROJECT_NAME"],
+                      environmentVariablesOverride=[
+                          {"name": "PHASE", "value": phase, "type": "PLAINTEXT"}
+                      ],
+                  )["build"]
+                  build_id = build["id"]
+
+                  status = "IN_PROGRESS"
+                  # Leave ~60s of head-room so a timeout is reported, not swallowed.
+                  while context.get_remaining_time_in_millis() > 60_000:
+                      time.sleep(15)
+                      status = client.batch_get_builds(ids=[build_id])["builds"][0][
+                          "buildStatus"
+                      ]
+                      if status in TERMINAL:
+                          break
+
+                  if status != "SUCCEEDED":
+                      cfnresponse.send(
+                          event,
+                          context,
+                          cfnresponse.FAILED,
+                          {"BuildId": build_id},
+                          reason="Bootstrap phase %s ended with status %s. See CodeBuild "
+                          "log group /aws/codebuild/%s."
+                          % (phase, status, os.environ["PROJECT_NAME"]),
+                      )
+                      return
+
+                  cfnresponse.send(
+                      event, context, cfnresponse.SUCCESS,
+                      {"BuildId": build_id, "Phase": phase},
+                  )
+              except Exception as exc:  # noqa: BLE001
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, reason=str(exc))
+
+  # Must complete before the HyperPod cluster is created: nodes need the health
+  # monitoring agent and device plugins present to reach InService.
+  HelmDependencies:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - BootstrapAccessEntry
+      - CoreDnsAddon
+      - VpcCniAddon
+      - KubeProxyAddon
+      - PodIdentityAddon
+      - CertManagerAddon
+      - EbsCsiAddon
+      - FsxCsiAddon
+      - S3CsiAddon
+    Properties:
+      ServiceToken: !GetAtt BootstrapRunnerFunction.Arn
+      Phase: helm
+
+  # ---------------------------------------------------------------------------
+  # SageMaker HyperPod cluster
+  # ---------------------------------------------------------------------------
+
+  HyperPodExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourceNamePrefix}-exec-role'
+      Description: Instance role assumed by HyperPod nodes.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: sagemaker.amazonaws.com}
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSageMakerClusterInstanceRolePolicy'
+        - !Ref BucketAccessPolicy
+      Policies:
+        - PolicyName: EksCniPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AmazonEKSCNIDescribe
+                Effect: Allow
+                Action:
+                  - 'ec2:DescribeInstances'
+                  - 'ec2:DescribeInstanceTypes'
+                  - 'ec2:DescribeTags'
+                  - 'ec2:DescribeNetworkInterfaces'
+                  - 'ec2:DescribeSubnets'
+                  - 'ec2:DescribeVpcs'
+                  - 'ec2:DescribeDhcpOptions'
+                  - 'ec2:DescribeSecurityGroups'
+                  - 'ec2:DetachNetworkInterface'
+                Resource: '*'
+              - Sid: AmazonEKSCNIEniTag
+                Effect: Allow
+                Action: 'ec2:CreateTags'
+                Resource: !Sub 'arn:${AWS::Partition}:ec2:*:*:network-interface/*'
+              - Sid: EniManagementOnInstances
+                Effect: Allow
+                Action:
+                  - 'ec2:AttachNetworkInterface'
+                  - 'ec2:AssignPrivateIpAddresses'
+                  - 'ec2:UnassignPrivateIpAddresses'
+                  - 'ec2:CreateNetworkInterface'
+                  - 'ec2:CreateNetworkInterfacePermission'
+                  - 'ec2:DeleteNetworkInterface'
+                  - 'ec2:DeleteNetworkInterfacePermission'
+                  - 'ec2:ModifyNetworkInterfaceAttribute'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+                  - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*'
+                  - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:vpc/${VPC}'
+              # Scoped to exactly the subnets and security group this cluster uses.
+              - Sid: EniManagementOnClusterSubnets
+                Effect: Allow
+                Action:
+                  - 'ec2:AssignPrivateIpAddresses'
+                  - 'ec2:UnassignPrivateIpAddresses'
+                  - 'ec2:CreateNetworkInterface'
+                  - 'ec2:CreateNetworkInterfacePermission'
+                  - 'ec2:DeleteNetworkInterface'
+                  - 'ec2:DeleteNetworkInterfacePermission'
+                  - 'ec2:DetachNetworkInterface'
+                  - 'ec2:ModifyNetworkInterfaceAttribute'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${HyperPodSubnet1}'
+                  - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${HyperPodSubnet2}'
+                  - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${HyperPodSubnet3}'
+                  - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${HyperPodSubnet4}'
+                  - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/${ClusterSecurityGroup}'
+        - PolicyName: ClusterRuntimeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: EcrPull
+                Effect: Allow
+                Action:
+                  - 'ecr:GetAuthorizationToken'
+                  - 'ecr:BatchCheckLayerAvailability'
+                  - 'ecr:BatchGetImage'
+                  - 'ecr:GetDownloadUrlForLayer'
+                Resource: '*'
+              - Sid: CloudWatchAlarms
+                Effect: Allow
+                Action: 'cloudwatch:DescribeAlarms'
+                Resource: '*'
+              - Sid: PodIdentity
+                Effect: Allow
+                Action: 'eks-auth:AssumeRoleForPodIdentity'
+                Resource: !GetAtt EksCluster.Arn
+              - Sid: PrometheusRemoteWrite
+                Effect: Allow
+                Action: 'aps:RemoteWrite'
+                Resource: !GetAtt PrometheusWorkspace.Arn
+
+  # Role HyperPod assumes to scale the cluster (Karpenter-driven continuous
+  # provisioning adds and removes nodes on its own).
+  HyperPodClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourceNamePrefix}-cluster-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: hyperpod.sagemaker.amazonaws.com}
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: !Sub '${ResourceNamePrefix}-autoscaling'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sagemaker:BatchAddClusterNodes'
+                  - 'sagemaker:BatchDeleteClusterNodes'
+                Resource: !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:cluster/*'
+              - Effect: Allow
+                Action: ['kms:CreateGrant', 'kms:DescribeKey']
+                Resource: !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                Condition:
+                  StringLike: {'kms:ViaService': 'sagemaker.*.amazonaws.com'}
+                  Bool: {'kms:GrantIsForAWSResource': 'true'}
+                  'ForAllValues:StringEquals':
+                    'kms:GrantOperations':
+                      - CreateGrant
+                      - Decrypt
+                      - DescribeKey
+                      - GenerateDataKeyWithoutPlaintext
+                      - ReEncryptTo
+                      - ReEncryptFrom
+                      - RetireGrant
+
+  HyperPodCluster:
+    Type: AWS::SageMaker::Cluster
+    DependsOn:
+      - HelmDependencies
+      - LifecycleScript
+      - HyperPodDefaultRoute
+      - S3GatewayEndpoint
+    Properties:
+      ClusterName: !Ref HyperPodClusterName
+      NodeRecovery: Automatic
+      NodeProvisioningMode: Continuous
+      ClusterRole: !GetAtt HyperPodClusterRole.Arn
+      AutoScaling:
+        Mode: Enable
+        AutoScalerType: Karpenter
+      TieredStorageConfig:
+        Mode: Disable
+      Orchestrator:
+        Eks:
+          ClusterArn: !GetAtt EksCluster.Arn
+      VpcConfig:
+        SecurityGroupIds: [!Ref ClusterSecurityGroup]
+        Subnets: [!Ref HyperPodSubnet1, !Ref HyperPodSubnet2, !Ref HyperPodSubnet3, !Ref HyperPodSubnet4]
+      InstanceGroups:
+        - InstanceGroupName: general-purpose
+          InstanceType: !Ref GeneralPurposeInstanceType
+          InstanceCount: !Ref GeneralPurposeInstanceCount
+          ThreadsPerCore: 2
+          ExecutionRole: !GetAtt HyperPodExecutionRole.Arn
+          LifeCycleConfig:
+            SourceS3Uri: !Sub 's3://${DataBucket}/'
+            OnCreate: on_create.sh
+        - InstanceGroupName: accelerated
+          InstanceType: !Ref AcceleratedInstanceType
+          InstanceCount: !Ref AcceleratedInstanceCount
+          ThreadsPerCore: 2
+          ExecutionRole: !GetAtt HyperPodExecutionRole.Arn
+          LifeCycleConfig:
+            SourceS3Uri: !Sub 's3://${DataBucket}/'
+            OnCreate: on_create.sh
+          InstanceStorageConfigs:
+            - EbsVolumeConfig:
+                VolumeSizeInGB: !Ref AcceleratedEbsVolumeSizeInGB
+          # Pinned to the FSx AZ so Lustre traffic never crosses an AZ boundary.
+          OverrideVpcConfig:
+            SecurityGroupIds: [!Ref ClusterSecurityGroup]
+            Subnets:
+              - !If
+                - PrimaryAzIs0
+                - !Ref HyperPodSubnet1
+                - !If
+                  - PrimaryAzIs1
+                  - !Ref HyperPodSubnet2
+                  - !If [PrimaryAzIs2, !Ref HyperPodSubnet3, !Ref HyperPodSubnet4]
+      Tags:
+        - {Key: SageMaker, Value: 'true'}
+        - {Key: Workload, Value: on-policy-distillation}
+
+  # --- HyperPod-side add-ons (installed once the cluster exists) -------------
+
+  HyperPodObservabilityAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: HyperPodCluster
+    Properties:
+      ClusterName: !Ref EksCluster
+      AddonName: amazon-sagemaker-hyperpod-observability
+      ResolveConflicts: OVERWRITE
+      PodIdentityAssociations:
+        - ServiceAccount: hyperpod-observability-operator-otel-collector
+          RoleArn: !GetAtt ObservabilityAddonRole.Arn
+      ConfigurationValues: !Sub
+        - |
+          {
+            "ampWorkspace": {
+              "prometheusEndpoint": "${PrometheusWorkspace.PrometheusEndpoint}",
+              "arn": "${PrometheusWorkspace.Arn}"
+            },
+            ${AmgBlock}
+            "metricsProvider": {
+              "trainingMetrics": {"level": "${TrainingMetricLevel}", "scrapeInterval": 30},
+              "inferenceMetrics": {"level": "BASIC", "scrapeInterval": 30},
+              "taskGovernanceMetrics": {"level": "${TaskGovernanceMetricLevel}", "scrapeInterval": 30},
+              "scalingMetrics": {"level": "${ScalingMetricLevel}", "scrapeInterval": 30},
+              "clusterMetrics": {"level": "${ClusterMetricLevel}", "scrapeInterval": 30},
+              "nodeMetrics": {"level": "${NodeMetricLevel}", "scrapeInterval": 30},
+              "acceleratedComputeMetrics": {"level": "${AcceleratedComputeMetricLevel}", "scrapeInterval": 30},
+              "networkMetrics": {"level": "${NetworkMetricLevel}", "scrapeInterval": 30},
+              "rayMetrics": {"level": "${RayMetricLevel}", "scrapeInterval": 30}
+            },
+            "logging": {"enabled": ${ObservabilityLoggingEnabled}}
+          }
+        - AmgBlock: !If
+            - UseGrafana
+            - !Sub '"amgWorkspace": {"workspaceName": "${GrafanaWorkspace.Id}", "arn": "arn:${AWS::Partition}:grafana:${AWS::Region}:${AWS::AccountId}:/workspaces/${GrafanaWorkspace.Id}"},'
+            - ''
+      Tags:
+        - {Key: SageMaker, Value: 'true'}
+
+  TaskGovernanceAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: HyperPodCluster
+    Properties:
+      ClusterName: !Ref EksCluster
+      AddonName: amazon-sagemaker-hyperpod-taskgovernance
+      ResolveConflicts: OVERWRITE
+
+  # Applies the FSx and S3 PersistentVolumes once both the file system and the
+  # cluster exist, and the opd-workspace service account for HyperPod-hosted spaces.
+  StorageBootstrap:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: [HyperPodCluster, FsxCsiAddon, S3CsiAddon, FsxFileSystem]
+    Properties:
+      ServiceToken: !GetAtt BootstrapRunnerFunction.Arn
+      Phase: storage
+
+  # ---------------------------------------------------------------------------
+  # SageMaker Studio domain with access to the HyperPod cluster.
+  #
+  # Studio reaches HyperPod through the amazon-sagemaker-spaces add-on: the
+  # jupyter-k8s controller runs in the EKS cluster under a pod identity, spaces
+  # land on HyperPod nodes, and the domain execution role gets an EKS access
+  # entry so notebooks can talk to the Kubernetes API.
+  # ---------------------------------------------------------------------------
+
+  SpaceSsmManagedNodeRole:
+    Type: AWS::IAM::Role
+    Condition: UseStudio
+    Properties:
+      # Name must start with sagemaker-space- under /service-role/ so the
+      # controller's scoped iam:PassRole applies.
+      RoleName: !Sub 'sagemaker-space-SSMManagedNode-${ResourceNamePrefix}'
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ssm.amazonaws.com}
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals: {'aws:SourceAccount': !Ref 'AWS::AccountId'}
+              ArnLike: {'aws:SourceArn': !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:*'}
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+
+  SpaceControllerRole:
+    Type: AWS::IAM::Role
+    Condition: UseStudio
+    Properties:
+      RoleName: !Sub 'sagemaker-space-Controller-${ResourceNamePrefix}'
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: pods.eks.amazonaws.com}
+            Action: ['sts:AssumeRole', 'sts:TagSession']
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+                'aws:SourceArn': !GetAtt EksCluster.Arn
+      Policies:
+        - PolicyName: SageMakerSpacesController
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: SsmActivationLifecycle
+                Effect: Allow
+                Action:
+                  - 'ssm:CreateActivation'
+                  - 'ssm:DeleteActivation'
+                  - 'ssm:DescribeActivations'
+                  - 'ssm:DescribeSessions'
+                  - 'ssm:DescribeInstanceInformation'
+                Resource: '*'
+              - Sid: SsmManagedNodeLifecycle
+                Effect: Allow
+                Action: ['ssm:DeregisterManagedInstance', 'ssm:StartSession']
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:managed-instance/*'
+              - Sid: SsmStartSessionDocuments
+                Effect: Allow
+                Action: 'ssm:StartSession'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-StartSSHSession'
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/SageMaker-Space*'
+              - Sid: SsmSpaceDocuments
+                Effect: Allow
+                Action: ['ssm:CreateDocument', 'ssm:DescribeDocument', 'ssm:AddTagsToResource']
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/SageMaker-Space*'
+              - Sid: SsmTagManagedInstances
+                Effect: Allow
+                Action: 'ssm:AddTagsToResource'
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:managed-instance/*'
+              - Sid: SsmActivationTier
+                Effect: Allow
+                Action: ['ssm:UpdateServiceSetting', 'ssm:GetServiceSetting', 'ssm:ResetServiceSetting']
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:servicesetting/ssm/managed-instance/activation-tier'
+              - Sid: PassSsmManagedNodeRole
+                Effect: Allow
+                Action: 'iam:PassRole'
+                Resource: !GetAtt SpaceSsmManagedNodeRole.Arn
+                Condition:
+                  StringEquals: {'iam:PassedToService': 'ssm.amazonaws.com'}
+
+  SageMakerSpacesAddon:
+    Type: AWS::EKS::Addon
+    Condition: UseStudio
+    DependsOn: HyperPodCluster
+    Properties:
+      ClusterName: !Ref EksCluster
+      AddonName: amazon-sagemaker-spaces
+      ResolveConflicts: OVERWRITE
+      PodIdentityAssociations:
+        - ServiceAccount: jupyter-k8s-controller-manager
+          RoleArn: !GetAtt SpaceControllerRole.Arn
+      ConfigurationValues: !Sub |
+        {
+          "jupyter-k8s": {"workspacePodWatching": {"enable": true}},
+          "jupyter-k8s-aws-hyperpod": {
+            "remoteAccess": {
+              "enabled": true,
+              "ssmManagedNodeRole": "service-role/sagemaker-space-SSMManagedNode-${ResourceNamePrefix}"
+            }
+          }
+        }
+      Tags:
+        - {Key: SageMaker, Value: 'true'}
+
+  StudioExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: UseStudio
+    Properties:
+      # Execution role for Studio spaces; also the principal that gets the EKS
+      # access entry below.
+      RoleName: !Sub '${ResourceNamePrefix}-studio-exec-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: sagemaker.amazonaws.com}
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSageMakerFullAccess'
+        - !Ref BucketAccessPolicy
+      Policies:
+        - PolicyName: HyperPodAndEksAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DescribeAndUseHyperPodCluster
+                Effect: Allow
+                Action:
+                  - 'sagemaker:DescribeCluster'
+                  - 'sagemaker:ListClusters'
+                  - 'sagemaker:ListClusterNodes'
+                  - 'sagemaker:DescribeClusterNode'
+                  - 'sagemaker:UpdateCluster'
+                  - 'sagemaker:UpdateClusterSoftware'
+                  - 'sagemaker:BatchAddClusterNodes'
+                  - 'sagemaker:BatchDeleteClusterNodes'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:cluster/*'
+              - Sid: EksApiAccess
+                Effect: Allow
+                Action:
+                  - 'eks:DescribeCluster'
+                  - 'eks:ListClusters'
+                  - 'eks:AccessKubernetesApi'
+                  - 'eks:ListAddons'
+                  - 'eks:DescribeAddon'
+                Resource: !GetAtt EksCluster.Arn
+              - Sid: SharedStorageDiscovery
+                Effect: Allow
+                Action: ['fsx:DescribeFileSystems', 'fsx:ListTagsForResource']
+                Resource: '*'
+              - Sid: QueryPrometheus
+                Effect: Allow
+                Action:
+                  - 'aps:QueryMetrics'
+                  - 'aps:GetLabels'
+                  - 'aps:GetSeries'
+                  - 'aps:GetMetricMetadata'
+                  - 'aps:DescribeWorkspace'
+                  - 'aps:ListWorkspaces'
+                Resource: '*'
+              - Sid: RemoteAccessToSpaces
+                Effect: Allow
+                Action: ['ssm:StartSession', 'ssm:TerminateSession', 'ssm:DescribeSessions']
+                Resource: '*'
+              - Sid: PassSelfToSageMaker
+                Effect: Allow
+                Action: 'iam:PassRole'
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ResourceNamePrefix}-studio-exec-role'
+                Condition:
+                  StringEquals: {'iam:PassedToService': 'sagemaker.amazonaws.com'}
+
+  # Grants Studio notebooks Kubernetes API access on the HyperPod EKS cluster.
+  StudioEksAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Condition: UseStudio
+    Properties:
+      ClusterName: !Ref EksCluster
+      PrincipalArn: !GetAtt StudioExecutionRole.Arn
+      AccessPolicies:
+        - PolicyArn: !Sub 'arn:${AWS::Partition}:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy'
+          AccessScope: {Type: cluster}
+
+  # A JupyterLab space hosted ON the HyperPod nodes (amazon-sagemaker-spaces add-on) is a pod, so
+  # it does not receive StudioExecutionRole. Without an AWS identity its notebook cannot run
+  # `aws`, `aws s3 sync` or `kubectl`. Spaces that set `serviceAccountName: opd-workspace` (created
+  # by the bootstrap's storage phase) get this role through EKS Pod Identity: the HyperPod and EKS
+  # lookups the notebook does, the shared bucket, and Kubernetes access limited to editing the
+  # `default` namespace plus read-only cluster-wide (nodes, PVs) -- what the notebook needs.
+  HyperPodSpaceRole:
+    Type: AWS::IAM::Role
+    Condition: UseStudio
+    Properties:
+      RoleName: !Sub '${ResourceNamePrefix}-hyperpod-space-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: pods.eks.amazonaws.com}
+            Action: ['sts:AssumeRole', 'sts:TagSession']
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+                'aws:SourceArn': !GetAtt EksCluster.Arn
+      ManagedPolicyArns:
+        - !Ref BucketAccessPolicy
+      Policies:
+        - PolicyName: NotebookClusterLookups
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DescribeHyperPodCluster
+                Effect: Allow
+                Action: ['sagemaker:DescribeCluster', 'sagemaker:ListClusterNodes']
+                Resource: !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:cluster/*'
+              - Sid: DescribeEksCluster
+                Effect: Allow
+                Action: ['eks:DescribeCluster']
+                Resource: !GetAtt EksCluster.Arn
+
+  HyperPodSpacePodIdentity:
+    Type: AWS::EKS::PodIdentityAssociation
+    Condition: UseStudio
+    DependsOn: [PodIdentityAddon, StorageBootstrap]
+    Properties:
+      ClusterName: !Ref EksCluster
+      Namespace: default
+      ServiceAccount: opd-workspace
+      RoleArn: !GetAtt HyperPodSpaceRole.Arn
+
+  HyperPodSpaceEksAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Condition: UseStudio
+    Properties:
+      ClusterName: !Ref EksCluster
+      PrincipalArn: !GetAtt HyperPodSpaceRole.Arn
+      AccessPolicies:
+        - PolicyArn: !Sub 'arn:${AWS::Partition}:eks::aws:cluster-access-policy/AmazonEKSEditPolicy'
+          AccessScope: {Type: namespace, Namespaces: [default]}
+        - PolicyArn: !Sub 'arn:${AWS::Partition}:eks::aws:cluster-access-policy/AmazonEKSAdminViewPolicy'
+          AccessScope: {Type: cluster}
+
+  # Clones the distillation repository into every JupyterLab app in this domain and
+  # writes the cluster coordinates the notebook needs. Attached as the domain's
+  # built-in lifecycle configuration (runs automatically, no user selection) and as
+  # a selectable one, so it also applies to spaces created by hand in the Studio UI
+  # — including spaces whose compute is a HyperPod cluster.
+  StudioRepoCloneLifecycleConfig:
+    Type: AWS::SageMaker::StudioLifecycleConfig
+    Condition: UseStudio
+    Properties:
+      StudioLifecycleConfigName: !Sub '${ResourceNamePrefix}-clone-repo'
+      StudioLifecycleConfigAppType: JupyterLab
+      StudioLifecycleConfigContent: !Base64
+        'Fn::Sub':
+          - |
+            #!/bin/bash
+            # -----------------------------------------------------------------
+            # Runs as sagemaker-user every time the JupyterLab app starts.
+            # Clones (or fast-forwards) the on-policy distillation repository and
+            # writes the cluster-specific environment variables. Every step is
+            # guarded: a failure here must never stop the space from starting.
+            # -----------------------------------------------------------------
+            set -x
+            exec > >(tee -a "$HOME/.opd-lifecycle.log") 2>&1
+            echo "=== on-policy distillation lifecycle config: $(date -u) ==="
+
+            REPO_URL="${GitRepositoryUrl}"
+            REPO_NAME=$(basename "$REPO_URL" .git)
+            REPO_DIR="$HOME/$REPO_NAME"
+
+            git config --global --add safe.directory "$REPO_DIR" || true
+
+            if [ -d "$REPO_DIR/.git" ]; then
+              git -C "$REPO_DIR" fetch --all --prune || true
+              git -C "$REPO_DIR" pull --ff-only || echo "pull skipped (local changes or diverged branch)"
+            else
+              git clone ${BranchArg}"$REPO_URL" "$REPO_DIR" \
+                || echo "clone failed - clone it from the JupyterLab git panel instead"
+            fi
+
+            # Cluster coordinates, so the notebook and manifests need no hand editing.
+            cat > "$HOME/opd-env.sh" <<EOF
+            # Written by the ${ResourceNamePrefix} Studio lifecycle configuration; sourced from ~/.bashrc.
+            export AWS_DEFAULT_REGION=${AWS::Region}
+            export REGION=${AWS::Region}
+            export HP_CLUSTER_NAME=${HyperPodClusterName}
+            export EKS_CLUSTER_NAME=${EksCluster}
+            export EKS_CLUSTER_ARN=${EksCluster.Arn}
+            export CTX=${EksCluster.Arn}
+            export NAMESPACE=default
+            export S3_BUCKET=${DataBucket}
+            export FSX_FILE_SYSTEM_ID=${FsxFileSystem}
+            export OPD_REPO_DIR=$REPO_DIR
+            export PATH=\$HOME/bin:\$PATH
+            EOF
+
+            grep -q 'opd-env.sh' "$HOME/.bashrc" 2>/dev/null \
+              || echo '[ -f "$HOME/opd-env.sh" ] && . "$HOME/opd-env.sh"' >> "$HOME/.bashrc"
+
+            # Pre-fill manifests/env_vars (CTX, S3_BUCKET, REGION are blank in the repo).
+            ENV_VARS=$(find "$REPO_DIR" -maxdepth 4 -type f -name env_vars -path '*manifests*' 2>/dev/null | head -n 1)
+            if [ -n "$ENV_VARS" ]; then
+              [ -f "$ENV_VARS.orig" ] || cp "$ENV_VARS" "$ENV_VARS.orig" || true
+              sed -i "s|^export CTX=.*|export CTX=${EksCluster.Arn}|" "$ENV_VARS" || true
+              sed -i "s|^export S3_BUCKET=.*|export S3_BUCKET=${DataBucket}|" "$ENV_VARS" || true
+              sed -i "s|^export REGION=.*|export REGION=${AWS::Region}|" "$ENV_VARS" || true
+              echo "patched $ENV_VARS (CTX, S3_BUCKET, REGION)"
+            fi
+
+            echo "=== lifecycle config finished; repository at $REPO_DIR ==="
+            exit 0
+          - BranchArg: !If [HasGitBranch, !Sub '--branch ${GitRepositoryBranch} ', '']
+      Tags:
+        - {Key: Workload, Value: on-policy-distillation}
+
+  StudioDomain:
+    Type: AWS::SageMaker::Domain
+    Condition: UseStudio
+    DependsOn: [SageMakerSpacesAddon, StudioEksAccessEntry]
+    Properties:
+      DomainName: !Ref StudioDomainName
+      AuthMode: IAM
+      VpcId: !Ref VPC
+      SubnetIds: [!Ref HyperPodSubnet1, !Ref HyperPodSubnet2, !Ref HyperPodSubnet3, !Ref HyperPodSubnet4]
+      AppNetworkAccessType: PublicInternetOnly
+      DefaultUserSettings:
+        ExecutionRole: !GetAtt StudioExecutionRole.Arn
+        SecurityGroups: [!Ref ClusterSecurityGroup]
+        StudioWebPortal: ENABLED
+        DefaultLandingUri: 'studio::'
+        AutoMountHomeEFS: Enabled
+        SharingSettings:
+          NotebookOutputOption: Allowed
+          S3OutputPath: !Sub 's3://${DataBucket}/studio/sharing'
+        JupyterLabAppSettings:
+          AppLifecycleManagement:
+            IdleSettings:
+              LifecycleManagement: ENABLED
+              IdleTimeoutInMinutes: 120
+          # BuiltInLifecycleConfigArn runs on every JupyterLab app start without the
+          # user selecting anything; LifecycleConfigArns makes the same script
+          # selectable when a space is created by hand in the Studio UI.
+          BuiltInLifecycleConfigArn: !GetAtt StudioRepoCloneLifecycleConfig.StudioLifecycleConfigArn
+          LifecycleConfigArns:
+            - !GetAtt StudioRepoCloneLifecycleConfig.StudioLifecycleConfigArn
+          CodeRepositories:
+            - RepositoryUrl: !Ref GitRepositoryUrl
+        SpaceStorageSettings:
+          DefaultEbsStorageSettings:
+            DefaultEbsVolumeSizeInGb: 50
+            MaximumEbsVolumeSizeInGb: 1024
+      DomainSettings:
+        DockerSettings:
+          EnableDockerAccess: ENABLED
+      Tags:
+        - {Key: Workload, Value: on-policy-distillation}
+
+  StudioUserProfile:
+    Type: AWS::SageMaker::UserProfile
+    Condition: UseStudio
+    Properties:
+      DomainId: !GetAtt StudioDomain.DomainId
+      UserProfileName: !Ref StudioUserProfileName
+      UserSettings:
+        ExecutionRole: !GetAtt StudioExecutionRole.Arn
+        # Private spaces inherit their JupyterLab settings from the owning user
+        # profile, so the clone script and the code repository are repeated here.
+        JupyterLabAppSettings:
+          BuiltInLifecycleConfigArn: !GetAtt StudioRepoCloneLifecycleConfig.StudioLifecycleConfigArn
+          LifecycleConfigArns:
+            - !GetAtt StudioRepoCloneLifecycleConfig.StudioLifecycleConfigArn
+          CodeRepositories:
+            - RepositoryUrl: !Ref GitRepositoryUrl
+
+  # Ready-to-open JupyterLab space. The lifecycle configuration below clones the
+  # repository into it on first start, so opening the space is the only manual step
+  # between a deployed stack and a runnable notebook.
+  StudioSpace:
+    Type: AWS::SageMaker::Space
+    Condition: UseStudioSpace
+    DependsOn: StudioUserProfile
+    Properties:
+      DomainId: !GetAtt StudioDomain.DomainId
+      SpaceName: !Ref StudioSpaceName
+      SpaceDisplayName: !Ref StudioSpaceName
+      OwnershipSettings:
+        OwnerUserProfileName: !Ref StudioUserProfileName
+      SpaceSharingSettings:
+        SharingType: Private
+      SpaceSettings:
+        AppType: JupyterLab
+        # Lets you attach a local IDE to this space over SSM, the same path the
+        # spaces add-on opens for HyperPod-hosted spaces.
+        RemoteAccess: ENABLED
+        SpaceStorageSettings:
+          EbsStorageSettings:
+            EbsVolumeSizeInGb: !Ref StudioSpaceEbsVolumeSizeInGB
+        JupyterLabAppSettings:
+          CodeRepositories:
+            - RepositoryUrl: !Ref GitRepositoryUrl
+          DefaultResourceSpec:
+            InstanceType: !Ref StudioSpaceInstanceType
+            LifecycleConfigArn: !GetAtt StudioRepoCloneLifecycleConfig.StudioLifecycleConfigArn
+      Tags:
+        - {Key: Workload, Value: on-policy-distillation}
+
+Outputs:
+
+  HyperPodClusterName:
+    Description: Name of the SageMaker HyperPod cluster
+    Value: !Ref HyperPodClusterName
+    Export: {Name: !Sub '${AWS::StackName}-HyperPodClusterName'}
+
+  HyperPodClusterArn:
+    Description: ARN of the SageMaker HyperPod cluster
+    Value: !GetAtt HyperPodCluster.ClusterArn
+    Export: {Name: !Sub '${AWS::StackName}-HyperPodClusterArn'}
+
+  EKSClusterName:
+    Description: Name of the orchestrating EKS cluster
+    Value: !Ref EksCluster
+    Export: {Name: !Sub '${AWS::StackName}-EKSClusterName'}
+
+  EKSClusterArn:
+    Description: ARN of the orchestrating EKS cluster
+    Value: !GetAtt EksCluster.Arn
+    Export: {Name: !Sub '${AWS::StackName}-EKSClusterArn'}
+
+  EKSClusterEndpoint:
+    Description: EKS API server endpoint
+    Value: !GetAtt EksCluster.Endpoint
+
+  EKSOidcIssuerUrl:
+    Description: OIDC issuer URL of the EKS cluster
+    Value: !GetAtt EksCluster.OpenIdConnectIssuerUrl
+
+  UpdateKubeconfigCommand:
+    Description: Command to configure kubectl against this cluster
+    Value: !Sub 'aws eks update-kubeconfig --region ${AWS::Region} --name ${EksCluster}'
+
+  S3BucketName:
+    Description: Shared S3 bucket for lifecycle scripts, datasets and checkpoints
+    Value: !Ref DataBucket
+    Export: {Name: !Sub '${AWS::StackName}-S3BucketName'}
+
+  S3BucketArn:
+    Description: ARN of the shared S3 bucket
+    Value: !GetAtt DataBucket.Arn
+    Export: {Name: !Sub '${AWS::StackName}-S3BucketArn'}
+
+  S3AccessLogsBucketName:
+    Description: S3 server access log bucket
+    Value: !Ref AccessLogsBucket
+
+  S3BucketAccessPolicyArn:
+    Description: Managed policy granting Mountpoint-S3 / Studio access to the shared bucket
+    Value: !Ref BucketAccessPolicy
+
+  FsxFileSystemId:
+    Description: FSx for Lustre file system ID
+    Value: !Ref FsxFileSystem
+
+  FsxMountName:
+    Description: FSx for Lustre mount name (used by the static PersistentVolume)
+    Value: !GetAtt FsxFileSystem.LustreMountName
+
+  FsxDnsName:
+    Description: FSx for Lustre DNS name
+    Value: !GetAtt FsxFileSystem.DNSName
+
+  PrometheusWorkspaceId:
+    Description: Amazon Managed Prometheus workspace ID
+    Value: !GetAtt PrometheusWorkspace.WorkspaceId
+
+  PrometheusWorkspaceArn:
+    Description: Amazon Managed Prometheus workspace ARN
+    Value: !GetAtt PrometheusWorkspace.Arn
+
+  PrometheusEndpoint:
+    Description: Amazon Managed Prometheus remote-write / query endpoint
+    Value: !GetAtt PrometheusWorkspace.PrometheusEndpoint
+
+  GrafanaWorkspaceEndpoint:
+    Condition: UseGrafana
+    Description: Amazon Managed Grafana workspace endpoint
+    Value: !GetAtt GrafanaWorkspace.Endpoint
+
+  GrafanaWorkspaceId:
+    Condition: UseGrafana
+    Description: Amazon Managed Grafana workspace ID
+    Value: !GetAtt GrafanaWorkspace.Id
+
+  StudioDomainId:
+    Condition: UseStudio
+    Description: SageMaker Studio domain ID
+    Value: !GetAtt StudioDomain.DomainId
+
+  StudioDomainUrl:
+    Condition: UseStudio
+    Description: SageMaker Studio URL
+    Value: !GetAtt StudioDomain.Url
+
+  StudioExecutionRoleArn:
+    Condition: UseStudio
+    Description: Execution role used by Studio spaces (has EKS + HyperPod + S3 access)
+    Value: !GetAtt StudioExecutionRole.Arn
+
+  StudioUserProfileName:
+    Condition: UseStudio
+    Description: Studio user profile that owns the JupyterLab space
+    Value: !Ref StudioUserProfileName
+
+  StudioLifecycleConfigArn:
+    Condition: UseStudio
+    Description: >-
+      JupyterLab lifecycle configuration that clones the notebook repository and
+      writes ~/opd-env.sh into the space
+    Value: !GetAtt StudioRepoCloneLifecycleConfig.StudioLifecycleConfigArn
+
+  NotebookRepositoryUrl:
+    Description: Git repository cloned into the JupyterLab space
+    Value: !Ref GitRepositoryUrl
+
+  StudioSpaceName:
+    Condition: UseStudioSpace
+    Description: JupyterLab space created in the Studio domain
+    Value: !Ref StudioSpaceName
+
+  StudioSpaceArn:
+    Condition: UseStudioSpace
+    Description: ARN of the JupyterLab space
+    Value: !GetAtt StudioSpace.SpaceArn
+
+  StudioSpaceJupyterLabUrl:
+    Condition: UseStudioSpace
+    Description: Direct URL to the JupyterLab application in the space
+    Value: !Sub '${StudioSpace.Url}&redirect=JupyterLab'
+
+  VpcId:
+    Description: VPC ID
+    Value: !Ref VPC
+
+  SecurityGroupId:
+    Description: Shared security group ID
+    Value: !Ref ClusterSecurityGroup
+
+  HyperPodSubnetIds:
+    Description: Subnets hosting HyperPod nodes
+    Value: !Join [',', [!Ref HyperPodSubnet1, !Ref HyperPodSubnet2, !Ref HyperPodSubnet3, !Ref HyperPodSubnet4]]
+
+  EksSubnetIds:
+    Description: Subnets hosting the EKS control-plane ENIs
+    Value: !Join [',', [!Ref EksSubnet1, !Ref EksSubnet2, !Ref EksSubnet3, !Ref EksSubnet4]]
+
+  HyperPodExecutionRoleArn:
+    Description: Instance role assumed by HyperPod nodes
+    Value: !GetAtt HyperPodExecutionRole.Arn
+
+  HyperPodClusterRoleArn:
+    Description: Role HyperPod assumes to scale the cluster
+    Value: !GetAtt HyperPodClusterRole.Arn

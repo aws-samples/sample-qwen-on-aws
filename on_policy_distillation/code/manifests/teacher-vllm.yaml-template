@@ -1,0 +1,178 @@
+# Teacher inference pool: a vLLM OpenAI-compatible server that scores student tokens
+# (echo-logprobs) during training and answers the eval's `teacher` phase.
+#
+#   set -a && source manifests/env_vars && set +a
+#   envsubst < manifests/teacher-vllm.yaml-template | kubectl --context "$CTX" apply -f -
+# Or launch it via the instantstart GUI / kiro-cli agent — see manifests/LAUNCH.md.
+#
+# WHY ONE UNQUANTISED TEACHER AT TP=2, ON A SINGLE SHARED NODE
+# -------------------------------------------------------------
+# This Deployment runs TEACHER_REPLICAS=1 pod holding a COMPLETE teacher SHARDED across TWO GPUs
+# of the single ml.g5.24xlarge. GPU 2 goes to the student (the distillation trainer, then the
+# eval) and GPU 3 to the rollout sampler, so the node is EXACTLY FULL (2 + 1 + 1 = 4 of 4).
+# K8s hands GPUs to a pod exclusively, so the devices must be PARTITIONED, not shared —
+# preflight check [8] adds TEACHER_TP x TEACHER_REPLICAS + trainer + sampler and reports 4 of 4
+# claimed as configured.
+#
+# TP=2 rather than one whole teacher on one GPU: bf16 Qwen/Qwen3.5-9B is 18.0 GiB and an A10G
+# reports 22.5 GiB, so weights + CUDA context + prefill activations exceed the ~20.2 GiB budget
+# (0.90 x 22.5) and leave NEGATIVE room for the cache; preflight check [2] hard-fails bf16 9B at
+# TP=1 by name. Sharded at TP=2 the weights become ~9.0 GiB/rank, leaving ~7.8 GiB/GPU of cache.
+# TP=2 also revives a per-prefill-layer all-reduce, and A10G has no NVLink: every all-reduce
+# crosses PCIe, and it matters WHICH two devices the kubelet assigns (on g5.24xlarge GPUs 0-1
+# and 2-3 sit under separate PCIe switches, so a split pair is measurably slower). preflight
+# check [4] warns on `SYS` pairings; the fix is to delete the pod and let the scheduler retry.
+#
+# THE NODE-FULL CONSEQUENCE. With the sampler enabled the node is 4 of 4 claimed, so the eval
+# Job cannot co-schedule with the trainer — it will sit Pending until opd-student Completes and
+# frees GPU 2. Deleting the student-sampler Deployment is the way to free GPU 3 for the eval
+# without touching the teacher; when you do, set SAMPLER_GPUS=0 so preflight's arithmetic
+# matches reality.
+#
+# WHY UNQUANTISED. The teacher's per-token log-probs ARE the supervision signal, so quantisation
+# error lands directly in the KL target. Serving bf16 gives EXACT log-probs at the cost of a
+# second GPU (and the all-reduce above), and the W4A16 fallback (sanskar003/Qwen3.5-9B-AWQ at
+# TP=1) is a third-party checkpoint that perturbs the signal more than the 27B's partial W4A16
+# did — kept as an option in env_vars if you need the spare GPU back.
+#
+# Two quantised routes are closed on this hardware, and both fail minutes into pod startup:
+#  * in-flight NF4 is gone. Earlier revisions served a bf16 repo with
+#    `--quantization bitsandbytes --load-format bitsandbytes`; vLLM has deleted bitsandbytes
+#    from its quantization registry, so such a pod dies at startup with "Unknown quantization
+#    method: bitsandbytes". Pinning an older image does not help — Qwen3_5ForConditionalGeneration
+#    exists only in builds newer than the removal.
+#  * FP8/W8A8 is refused by the kernels, not silently downgraded. A10G is sm_86 and vLLM's
+#    CompressedTensorsW8A8Fp8 declares get_min_capability() == 89, so an FP8 9B (e.g.
+#    RedHatAI/Qwen3.5-9B-FP8-dynamic, 12.6 GiB) fails with "Quantization scheme is not supported
+#    for the current GPU. Min capability: 89. Current capability: 86."
+# W4A16 (`CompressedTensorsWNA16`) is "Turing and up" (75), the only quantised route this
+# hardware accepts if you take the W4A16 TP=1 fallback in env_vars.
+#
+# For the shipped route, TEACHER_QUANTIZATION="" and TEACHER_QUANT_FLAG is empty. The teacher
+# runs on --tensor-parallel-size 2 with --distributed-executor-backend mp (added via
+# TEACHER_DIST_FLAG when TEACHER_TP>1). preflight check [2] verifies these figures.
+#
+# CACHE ARITHMETIC, hybrid-aware. Qwen3.5 alternates 3 linear-attention layers to 1
+# full-attention layer, so of 32 layers only 8 hold a growing KV cache (32 KiB/token: 2 x 8 x 4
+# KV heads x 256 head_dim x 2 bytes) and 24 hold a fixed recurrent state per SEQUENCE (48 MB:
+# 24 x 32 value heads x 128 x 128 in fp32). At TP=2 both terms are sharded, so each rank's
+# ~7.8 GiB of cache holds ~253k tokens of KV, or ~141 concurrent sequences at the full
+# max_model_len once the state is counted. --max-num-seqs is 48 PER REPLICA and well inside
+# that: at this footprint the binding constraint is prefill compute, not memory.
+#
+# The teacher is the accuracy CEILING -- the student moves toward it and cannot pass it. Run
+# EVAL_PHASE=before,teacher first to measure the gap.
+# manifests/env_vars documents the 27B teacher for a higher ceiling (also TP=2, same partition).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: teacher-vllm
+  namespace: ${NAMESPACE}
+  labels: { app: teacher-vllm }
+spec:
+  # Each replica is a complete teacher on TEACHER_TP GPU(s). Raising this schedules more pods on
+  # the same node, and the device plugin gives each a distinct GPU, so no anti-affinity rule is
+  # needed. If a replica sits Pending, the partition is oversubscribed -- run preflight check [8].
+  replicas: ${TEACHER_REPLICAS}
+  # Recreate, not the default rolling update: the node's GPUs are fully partitioned, so a
+  # surge pod could never schedule and a changed spec would wait on it forever.
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: teacher-vllm }
+  template:
+    metadata:
+      labels: { app: teacher-vllm }
+    spec:
+      nodeSelector:
+        node.kubernetes.io/instance-type: ${INSTANCE_TYPE}
+      tolerations:
+        - key: sagemaker.amazonaws.com/node-health-status
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: vllm
+          image: ${VLLM_IMAGE}
+          command: ["/bin/bash", "-c"]
+          args:
+            # NOTE: every line below must stay at the SAME indentation, and none may be
+            # blank after envsubst -- YAML's folded scalar (>) turns an empty line into a
+            # real newline, which would cut the command in half. That is why the two
+            # possibly-empty flags, TEACHER_QUANT_FLAG (empty on the shipped bf16 route) and
+            # TEACHER_DIST_FLAG (empty only at TP=1), share a line with a non-empty argument.
+            - >
+              vllm serve ${TEACHER_MODEL}
+              --served-model-name ${TEACHER_MODEL_ID}
+              --tensor-parallel-size ${TEACHER_TP} ${TEACHER_DIST_FLAG}
+              --dtype ${TEACHER_DTYPE} ${TEACHER_QUANT_FLAG}
+              --host 0.0.0.0 --port 8000
+              --gpu-memory-utilization ${TEACHER_GPU_UTIL}
+              --max-model-len ${TEACHER_MAX_MODEL_LEN}
+              --max-num-seqs ${TEACHER_MAX_NUM_SEQS}
+              --max-logprobs 1
+              --return-tokens-as-token-ids
+          ports:
+            - { containerPort: 8000 }
+          env:
+            - { name: HF_HOME, value: "${HF_HOME}" }
+            # `fork` deadlocks with CUDA already initialised in the parent; vLLM's
+            # multiprocessing executor needs spawn for multi-GPU. Required at TP=2 (the
+            # shipped route) and kept unconditionally so a downgrade to TP=1 does not
+            # silently reintroduce the deadlock.
+            - { name: VLLM_WORKER_MULTIPROC_METHOD, value: "spawn" }
+            # The three NCCL settings below matter at TP=2 (the shipped route), where ranks
+            # all-reduce. They would be no-ops at TP=1 -- kept unconditionally.
+            #
+            # A10G has no NVLink but DOES support PCIe peer-to-peer. Leaving P2P enabled is
+            # measurably faster than routing all-reduce through host memory.
+            - { name: NCCL_P2P_DISABLE, value: "0" }
+            # Single-node TP: no cross-node fabric is involved, so don't let NCCL probe for
+            # (and time out on) InfiniBand.
+            - { name: NCCL_IB_DISABLE, value: "1" }
+            - { name: NCCL_DEBUG, value: "WARN" }
+          resources:
+            limits:
+              # TEACHER_TP devices PER REPLICA, so this Deployment claims TP x replicas of the
+              # node's NODE_GPUS -- two devices as configured (TP=2 x 1 replica); the other two
+              # go to the student and the sampler and the node is exactly full. preflight
+              # check [8] verifies that product fits.
+              nvidia.com/gpu: ${TEACHER_TP}
+          readinessProbe:
+            httpGet: { path: /v1/models, port: 8000 }
+            # 18.0 GiB of bf16 weights read across two GPUs, plus per-rank CUDA-graph capture
+            # and an NCCL init for the TP all-reduce: several minutes from a cold cache, and
+            # longer if the first pull is from HF rather than /fsx. Note that at
+            # TEACHER_REPLICAS>1 the pods pull concurrently, making a cold first start I/O-bound.
+            initialDelaySeconds: 120
+            periodSeconds: 15
+            failureThreshold: 120
+          startupProbe:
+            httpGet: { path: /v1/models, port: 8000 }
+            periodSeconds: 15
+            failureThreshold: 80     # ~20 min before the kubelet gives up
+          volumeMounts:
+            - { name: fsx, mountPath: /fsx }   # HF cache (high throughput)
+            - { name: s3,  mountPath: /s3 }    # model registry
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: fsx
+          persistentVolumeClaim: { claimName: ${FSX_CLAIM} }
+        - name: s3
+          persistentVolumeClaim: { claimName: ${S3_CLAIM} }
+        - name: shm
+          # TP ranks exchange tensors through shared memory, so an undersized /dev/shm is the
+          # classic cause of a silent hang partway through multi-GPU startup. At TP=2 (the
+          # shipped route) 16Gi is required; charged per POD, so it multiplies with
+          # TEACHER_REPLICAS. `medium: Memory` bills against node RAM (384 GiB), which also
+          # carries the trainer's and the sampler's /dev/shm.
+          emptyDir: { medium: Memory, sizeLimit: 16Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: teacher-vllm
+  namespace: ${NAMESPACE}
+spec:
+  type: ClusterIP
+  selector: { app: teacher-vllm }
+  ports:
+    - { name: http, port: 8000, targetPort: 8000 }

@@ -1,0 +1,217 @@
+# Source before rendering manifests:  set -a && source manifests/env_vars && set +a
+# Then:  envsubst < manifests/<name>.yaml-template | kubectl --context "$CTX" apply -f -
+#
+# This file is the single source of truth for a run. Every CLI flag in src/*.py defaults from
+# one of these variables, the opd-config ConfigMap carries them into the pods, and the Jobs pass
+# no arguments of their own.
+#
+# Shipped configuration: on-policy distillation of Qwen3.5-2B (instruct, LoRA r=128) from
+# Qwen3.5-9B on GSM8K, no supervised warm-up. The student is picked by a baseline eval of the
+# candidates first (notebook Part 1). Measured results and run history: experiments/
+#
+# NOTE: the SageMaker notebook role has been granted EKS cluster-admin (AmazonEKSClusterAdminPolicy),
+# so it can create/delete cluster resources directly from the notebook. To revoke:
+#   aws eks disassociate-access-policy --cluster-name <cluster_name> --region <region> \
+#     --principal-arn arn:aws:iam::<acct_id>:role/service-role/<role> \
+#     --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+
+# --- Cluster ---
+# Account-specific values. Fill them in here, or put them in manifests/env_vars.local (git-ignored,
+# sourced at the end of this file) so they never get committed. The notebook's Part 0 prints both.
+export CTX=                                   # EKS cluster ARN
+export S3_BUCKET=                             # bucket behind the s3-claim PV
+export NAMESPACE=default
+export REGION=us-west-2                       # pre-filled by the CloudFormation lifecycle script
+
+# --- GPU budget: ONE ml.g5.24xlarge = 4x A10G (22.5 GiB usable each) ---
+# K8s allocates GPUs exclusively, so the four devices are partitioned, never shared:
+#   GPU 0-1  teacher vLLM, bf16 Qwen3.5-9B sharded over TP=2 (18.0 GiB does not fit one A10G)
+#   GPU 2    student trainer (LoRA)
+#   GPU 3    student rollout sampler (vLLM, LoRA hot-swap)
+# 2 + 1 + 1 = 4 of 4: the node is exactly full. The eval needs no GPU of its own -- it generates
+# through the sampler and the teacher over HTTP (EVAL_STUDENT_URL), so it runs alongside training.
+# preflight.py check [8] verifies TEACHER_TP x TEACHER_REPLICAS + GPU_PER_NODE + SAMPLER_GPUS fits.
+#
+# Teacher alternatives (same partition unless noted):
+#   27B W4A16, higher ceiling:  TEACHER_MODEL=Qwen/Qwen3.5-27B-GPTQ-Int4 TEACHER_MODEL_ID=Qwen/Qwen3.5-27B
+#                               TEACHER_QUANTIZATION=gptq_marlin TEACHER_WEIGHTS_GIB=28.2 TEACHER_PARAMS_B=27
+#                               TEACHER_MAX_NUM_SEQS=24 TEACHER_CONCURRENCY=24
+#   9B W4A16 at TP=1, frees a GPU but perturbs the log-probs and is a third-party build:
+#                               TEACHER_MODEL=sanskar003/Qwen3.5-9B-AWQ TEACHER_QUANTIZATION=compressed-tensors
+#                               TEACHER_WEIGHTS_GIB=7.96 TEACHER_TP=1
+# On sm_86 (A10G) only W4A16 quantisation loads: FP8/W8A8 needs compute capability 8.9, and vLLM
+# no longer ships bitsandbytes. preflight.py check [2] screens for both.
+export INSTANCE_TYPE=ml.g5.24xlarge
+export NODE_GPUS=4
+export TEACHER_TP=2                           # must divide the 9B's 4 KV heads and its linear-attention heads
+export TEACHER_REPLICAS=1                     # TP x REPLICAS teacher GPUs; check [8] counts the product
+export GPU_PER_NODE=1                         # student trainer GPUs
+export SAMPLER_GPUS=1                         # 0 if STUDENT_SAMPLER_URL is left empty
+
+# --- Storage ---
+# FSx for Lustre (/fsx) is the working store: HF cache, checkpoints, metrics, eval output.
+# S3 (/s3) holds the code (synced from src/) and serves as the model registry.
+export S3_CLAIM=s3-claim
+export FSX_CLAIM=fsx-claim
+export HF_HOME=/fsx/hf_cache
+export CODE_DIR=/s3/opd/src                   # synced via: aws s3 sync src s3://$S3_BUCKET/opd/src
+
+# --- Models ---
+# Teacher and student must share a tokenizer (the teacher scores the student's raw token ids);
+# preflight.py check [3] verifies it.
+export TEACHER_MODEL=Qwen/Qwen3.5-9B          # what vLLM loads: an HF id or a /fsx or /s3 path
+export TEACHER_MODEL_ID=Qwen/Qwen3.5-9B       # --served-model-name; keep it a real HF id (preflight reads it)
+export STUDENT_MODEL=Qwen/Qwen3.5-2B          # instruct model, trained with LoRA
+export TEACHER_PARAMS_B=9.65                  # preflight memory arithmetic only
+export TEACHER_WEIGHTS_GIB=18.0               # measured size of TEACHER_MODEL on disk
+export STUDENT_PARAMS_B=2
+export GPU_MEM_GB=22.5                        # usable per-GPU memory ("24 GB" A10G reports 22.5 GiB)
+
+# --- Teacher serving (manifests/teacher-vllm.yaml-template) ---
+# Qwen3.5 is a hybrid model: 8 of its 32 layers keep a KV cache, 24 hold a fixed recurrent state,
+# so ~7.8 GiB/rank of cache holds ~140 sequences at full length. MAX_NUM_SEQS is a compute choice.
+export TEACHER_QUANTIZATION=                  # "" = bf16 (exact log-probs) | gptq_marlin | compressed-tensors | awq_marlin
+case "$TEACHER_QUANTIZATION" in
+  "") TEACHER_QUANT_FLAG="" ;;
+  *)  TEACHER_QUANT_FLAG="--quantization $TEACHER_QUANTIZATION" ;;
+esac
+export TEACHER_QUANT_FLAG
+if [ "${TEACHER_TP}" -gt 1 ]; then TEACHER_DIST_FLAG="--distributed-executor-backend mp"; else TEACHER_DIST_FLAG=""; fi
+export TEACHER_DIST_FLAG
+export TEACHER_DTYPE=bfloat16
+export TEACHER_GPU_UTIL=0.90
+export TEACHER_MAX_MODEL_LEN=4096             # prompt + MAX_NEW_TOKENS must fit; also the sampler's limit
+export TEACHER_MAX_NUM_SEQS=48                # per replica
+
+# --- Images: AWS Deep Learning Containers (ECR Public), versioned tags ---
+# vllm:server-cuda-v2.6  -- vLLM 0.30.0, CUDA 13.0: the teacher, the student sampler and the eval.
+# pytorch:2.14.0-cu133-amzn2023 -- PyTorch 2.14.0, Python 3.12: the trainer. It ships no
+#   transformers/peft/datasets; the distill Job pip-installs them, with transformers pinned to the
+#   vLLM image's version so trainer and teacher run the same Qwen3.5 model code. Its CUDA 13.3
+#   runtime is newer than the node driver (CUDA 13.2), so the Job runs through the image's
+#   ENTRYPOINT, which enables CUDA forward compatibility (/usr/local/cuda/compat).
+# Preflight's quantisation check [2] imports vllm, which the trainer image lacks: it then only
+# warns, and only for a quantised teacher (the shipped bf16 teacher skips it).
+# Each image is ~9 GB compressed (~16-20 GiB on disk) and the node's root disk is 100 GiB: before
+# switching a running teacher/sampler to another build, delete finished Jobs so ~30 GiB is free
+# (`kubectl get --raw /api/v1/nodes/<node>/proxy/stats/summary`).
+# Versioned tags (not the floating server-cuda / 2.14-cu133-amzn2023): an upstream rebuild of a
+# floating tag would pull a second ~9 GB image. As measured, these were sha256:207fd808... and
+# sha256:3a6e5c60...
+export VLLM_IMAGE=public.ecr.aws/deep-learning-containers/vllm:server-cuda-v2.6
+export TRAIN_IMAGE=public.ecr.aws/deep-learning-containers/pytorch:2.14.0-cu133-amzn2023
+export EVAL_IMAGE=${VLLM_IMAGE}               # an HTTP client of vLLM; inspect-ai is pip-installed
+
+# --- Services (in-cluster DNS) ---
+export TEACHER_URL=http://teacher-vllm.$NAMESPACE.svc.cluster.local:8000/v1
+# vLLM student sampler (manifests/student-sampler.yaml-template), ~5-10x faster than HF generate.
+# Apply it before the trainer. Leave the URL empty to sample in-process (and set SAMPLER_GPUS=0).
+export STUDENT_SAMPLER=auto                   # auto | hf | vllm  (auto => vllm iff the URL is set)
+export STUDENT_SAMPLER_URL=http://student-sampler.$NAMESPACE.svc.cluster.local:8000/v1
+export SAMPLER_SYNC_EVERY=1                   # steps between LoRA hot-swaps into the sampler
+
+# --- Task / data ---
+# GSM8K: a wide base-to-teacher gap and short answers (~300 tokens). Also available:
+# TASK=gsm8k_native (zero-shot \boxed{} prompt) and TASK=math500 (TRAIN_DATASET=EleutherAI/hendrycks_math,
+# MAX_NEW_TOKENS=EVAL_MAX_TOKENS=2048, EVAL_LIMIT=500), which suits a 4B student.
+export TASK=gsm8k
+export TRAIN_DATASET=openai/gsm8k
+export TRAIN_DATASET_CONFIG=main
+export TRAIN_SPLIT=train
+export PROMPT_POOL_LIMIT=0                    # 0 = the whole pool (~7.5k prompts)
+export TRAIN_FEWSHOT=4                        # must equal EVAL_FEWSHOT (preflight [7])
+export CHAT_TEMPLATE=auto                     # must equal EVAL_CHAT_TEMPLATE; auto = the tokenizer's template
+export ENABLE_THINKING=0                      # must match on teacher and student; 1 needs ~4k-token budgets
+
+# --- On-policy distillation (src/train_distill.py) ---
+# The student generates its own rollouts, the teacher scores every token, and the update follows
+# the per-token reverse KL.
+export INIT_ADAPTER=                          # empty = pristine student; a student-step<N> dir to resume
+                                              # a crashed run (lower STEPS by what already ran)
+export RUN_DIR=/fsx/opd/gsm8k-opd             # checkpoints + metrics; use a new dir per run
+export STEPS=50                               # ~5.5 min/step => ~4.5 h; accuracy plateaus by step 25
+export SAMPLES_PER_PROMPT=4                   # 64 prompts x 4 samples per step, as in the Thinking Machines recipe
+export GROUP_SIZE=256                         # rollouts per step (= prompts x SAMPLES_PER_PROMPT); also the
+                                              # sampler's --max-num-seqs, so re-apply the sampler on change
+export BATCH_SIZE=256                         # rollouts per optimizer step
+export MICRO_BATCH_SIZE=2                     # backward chunk: changes memory, never the update
+export GEN_MICRO_BATCH=8                      # HF in-process sampler only
+export BUFFER_CAPACITY=512
+export BUFFER_MAX_AGE=-1                      # -1 = auto (SAMPLER_SYNC_EVERY with the vLLM sampler)
+export MAX_NEW_TOKENS=1024                    # >= EVAL_MAX_TOKENS
+export MAX_QUESTION_TOKENS=1024               # drop training questions longer than this (0 = off)
+export TRAIN_TEMPERATURE=0.7                  # fewer capped rollouts than 1.0. vLLM returns raw log-probs at any
+                                              # temperature, so logp_old matches the trainer; sampling from the
+                                              # sharpened policy is a small, uncorrected bias
+export TRUNCATED_POLICY=mask                  # drop | mask | keep -- capped rollouts: zero the final token's credit
+export ANSWER_SPAN_POLICY=mask                # zero credit on the final-answer line and <|im_end|>: those tokens
+                                              # carry the largest reverse KL, and without masking the student
+                                              # learns to stop writing answers
+export TRUNCATION_PENALTY=0                   # DAPO-style soft overlong penalty (needs TRUNCATED_POLICY mask|keep)
+export TRUNCATION_PENALTY_TAIL=512
+
+# Objective
+export KL_COEF=1.0
+export RKL_CLIP=10.0                          # per-token reverse-KL clamp (the KL is heavy-tailed)
+export CLIP_RATIO=0.2                         # PPO importance-ratio clip
+export LOSS_NORM=token                        # token | sequence (every rollout weighs the same)
+export WHITEN_ADVANTAGES=1                    # required: rollout reverse KL averages ~+0.3, so without a baseline
+                                              # nearly every sampled token is pushed down and the student flattens
+
+# Optimization
+# LoRA keeps the frozen base in bf16 and the adapter in fp32: a bf16 parameter would round
+# away updates smaller than its ~0.4% resolution.
+export PRECISION=lora                         # lora | full-fp32
+export LORA_R=128                             # also the sampler's --max-lora-rank
+export LORA_ALPHA=256                         # alpha/r = 2
+export LR=2e-5                                # 1e-4 collapses into long non-answers within a few steps
+export WEIGHT_DECAY=0.0
+export WARMUP_RATIO=0.05
+export GRAD_CLIP=1.0
+export ADAM_8BIT=0
+
+# Bookkeeping
+export SAVE_EVERY=25                          # each student-step<N> adapter is independently evaluable
+export LOG_EVERY=10
+export TEACHER_CONCURRENCY=32                 # concurrent scoring requests to the teacher
+export SEED=0
+export TRUST_REMOTE_CODE=0
+
+# --- Eval (src/eval_student.py, Inspect AI) ---
+# Three phases on the same samples: the base student, the distilled student, and the teacher.
+# The student cannot pass its teacher, so the reported metric is
+#     headroom_recovered = (after - before) / (teacher - before)
+# Run EVAL_PHASE=before,teacher once first: it measures the gap before committing to a long run.
+export EVAL_PHASE=all                         # all | both | any subset of before,after,teacher
+export EVAL_BASE_MODEL=${STUDENT_MODEL}
+export EVAL_STUDENT_URL=${STUDENT_SAMPLER_URL}  # set = generate through the sampler (fast, no GPU);
+                                              # empty = local HF provider (needs EVAL_GPUS=1)
+export EVAL_GPUS=0
+export EVAL_FT_MODEL_DIR=${RUN_DIR}/student-step${STEPS}  # served route: a LoRA adapter dir;
+                                              # local HF route: ${RUN_DIR}/student-final (merged)
+export EVAL_DIR=/fsx/opd/eval-gsm8k-opd       # summary.json + samples_<phase>.jsonl + Inspect logs
+export EVAL_SPLIT=                            # empty = the task's test split
+export EVAL_LIMIT=1319                        # the whole GSM8K test split
+export EVAL_SELECT=all                        # all | tail | head | shuffle
+export EVAL_FEWSHOT=4                         # must equal TRAIN_FEWSHOT
+export EVAL_MAX_TOKENS=1024                   # must not exceed MAX_NEW_TOKENS
+export EVAL_TEMPERATURE=0                     # greedy, so before/after compare the same samples deterministically
+# Majority vote (self-consistency): EVAL_VOTE_PHASES sample EVAL_VOTES answers per problem and score
+# the most common one; the other phases use EVAL_TEMPERATURE. Shipped: the distilled student votes,
+# the base and the teacher stay greedy, and every result and chart records which decoding it
+# used. EVAL_VOTES=1 = greedy everywhere.
+export EVAL_VOTES=8
+export EVAL_VOTE_PHASES=after                 # comma-separated subset of before,after,teacher, or all
+export EVAL_VOTE_TEMPERATURE=0.7              # = TRAIN_TEMPERATURE
+export EVAL_BATCH_SIZE=4                      # local HF provider only
+export EVAL_TEACHER_CONNECTIONS=32
+export EVAL_CHAT_TEMPLATE=auto                # must equal CHAT_TEMPLATE
+export EVAL_TORCH_DTYPE=bfloat16              # pinned for before AND after
+export EVAL_ANSWER_REL_TOL=1e-3
+export EVAL_TEXT_SIMILARITY=0.9
+export EVAL_SUMMARY_NAME=summary.json
+
+# --- Local overrides (git-ignored): CTX, S3_BUCKET, or anything else specific to your setup ---
+_ENV_LOCAL="$(dirname "${BASH_SOURCE[0]:-manifests/env_vars}")/env_vars.local"
+[ -f "$_ENV_LOCAL" ] && . "$_ENV_LOCAL"
+unset _ENV_LOCAL

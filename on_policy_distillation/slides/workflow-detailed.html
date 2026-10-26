@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>On-Policy Distillation on SageMaker HyperPod — Workflow</title>
+<style>
+  :root {
+    --navy: #232f3e; --orange: #ff9900; --grey: #9aa0a6;
+    --ink: #16191f; --muted: #5f6b7a; --line: #d5dbe3; --panel: #f7f8fa;
+    --teal: #0f766e; --blue: #2563eb; --purple: #7c3aed;
+  }
+  @page { size: 1920px 1080px; margin: 0; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { background: #fff; }
+  body { font-family: "Amazon Ember", -apple-system, "Helvetica Neue", Arial, sans-serif; color: var(--ink); }
+  .slide { position: relative; width: 1920px; height: 1080px; overflow: hidden; background: #fff; }
+
+  header { position: absolute; left: 40px; top: 28px; right: 40px; }
+  h1 { font-size: 44px; font-weight: 700; letter-spacing: -0.5px; }
+  h1 span { color: var(--orange); }
+  .sub { margin-top: 6px; font-size: 21px; color: var(--muted); }
+
+  .lane { position: absolute; left: 40px; font-size: 15px; font-weight: 700; letter-spacing: 2px; color: var(--muted); }
+
+  .card { position: absolute; background: #fff; border: 2px solid var(--line); border-radius: 14px; padding: 18px 22px; }
+  .card h2 { font-size: 24px; font-weight: 700; display: flex; align-items: center; gap: 12px; }
+  .num { flex: none; width: 36px; height: 36px; border-radius: 50%; background: var(--navy); color: #fff;
+         font-size: 19px; display: flex; align-items: center; justify-content: center; }
+  .where { margin: 6px 0 10px 48px; font-size: 15px; color: var(--muted); }
+  ul { list-style: none; }
+  li { position: relative; padding-left: 16px; font-size: 17px; line-height: 1.38; margin-bottom: 5px; }
+  li::before { content: ""; position: absolute; left: 0; top: 10px; width: 6px; height: 6px; border-radius: 50%; background: var(--orange); }
+  code { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 0.86em; background: #eef1f5; padding: 1px 5px; border-radius: 4px; white-space: nowrap; }
+
+  .setup { top: 164px; height: 290px; width: 430px; }
+  .run { top: 540px; height: 372px; }
+
+  /* distillation loop panel */
+  .distill { left: 40px; width: 900px; border-color: var(--orange); background: #fffaf2; }
+  .node { position: absolute; width: 196px; height: 88px; background: #fff; border: 2px solid var(--line); border-radius: 10px;
+          padding: 8px 10px; text-align: center; }
+  .node b { display: block; font-size: 16px; }
+  .node small { display: block; font-size: 13.5px; color: var(--muted); line-height: 1.3; margin-top: 2px; }
+  .node.sampler { border-color: var(--teal); }
+  .node.teacher { border-color: var(--navy); }
+  .node.trainer { border-color: var(--orange); }
+  .distill .side { position: absolute; left: 22px; bottom: 16px; width: 856px; display: flex; gap: 14px; }
+  .pill { flex: 1; background: #fff; border: 1px dashed #c9ced6; border-radius: 8px; padding: 8px 12px; font-size: 14.5px; line-height: 1.35; }
+  .pill b { color: var(--navy); }
+
+  .eval { left: 980px; width: 430px; }
+  .dash { left: 1450px; width: 430px; border-color: var(--navy); }
+
+  .bars { position: relative; height: 128px; margin: 4px 0 10px 4px; }
+  .bar { position: absolute; bottom: 22px; width: 70px; border-radius: 5px 5px 0 0; }
+  .bar-lbl { position: absolute; bottom: 0; width: 70px; text-align: center; font-size: 14px; color: var(--muted); }
+  .ceiling { position: absolute; left: 0; right: 16px; border-top: 2px dashed var(--navy); }
+  .ceiling span { position: absolute; right: 0; top: -20px; font-size: 13px; color: var(--navy); font-weight: 700; }
+  .formula { font-size: 14px; letter-spacing: -0.2px; white-space: nowrap; background: var(--panel); border-radius: 8px; padding: 7px 6px; margin-bottom: 8px; text-align: center; }
+
+  /* node / storage band */
+  .band { position: absolute; left: 40px; right: 40px; top: 938px; height: 118px; display: flex; gap: 22px; }
+  .node-box { flex: 1.9; border: 2px solid var(--navy); border-radius: 14px; padding: 10px 16px; }
+  .node-box .t, .store .t { font-size: 15px; font-weight: 700; color: var(--navy); margin-bottom: 8px; }
+  .node-box .t span, .store .t span { font-weight: 400; color: var(--muted); }
+  .gpus { display: flex; gap: 10px; }
+  .gpu { flex: 1; border-radius: 8px; color: #fff; padding: 7px 10px; font-size: 14.5px; line-height: 1.3; }
+  .gpu b { display: block; font-size: 13px; opacity: 0.85; letter-spacing: 1px; }
+  .g-teacher { background: var(--navy); }
+  .g-student { background: var(--orange); color: var(--ink); }
+  .g-sampler { background: var(--teal); }
+  .store { flex: 1; border: 2px solid var(--line); border-radius: 14px; padding: 10px 16px; font-size: 15px; line-height: 1.45; }
+
+  svg.arrows { position: absolute; left: 0; top: 0; pointer-events: none; }
+</style>
+</head>
+<body>
+<div class="slide">
+
+  <header>
+    <h1>On-Policy Distillation on SageMaker HyperPod — <span>code to eval dashboard</span></h1>
+    <div class="sub">Qwen3.5-9B teacher &rarr; Qwen3.5-2B student (LoRA r=128) &nbsp;·&nbsp; GSM8K, no SFT &nbsp;·&nbsp; one <code>ml.g5.24xlarge</code> (4× A10G) on HyperPod EKS &nbsp;·&nbsp; driven end-to-end from one notebook</div>
+  </header>
+
+  <div class="lane" style="top:140px">SETUP &amp; BASELINE — ONCE</div>
+  <div class="lane" style="top:516px">RUN — EACH EXPERIMENT</div>
+
+  <!-- ============ SETUP ROW ============ -->
+  <div class="card setup" style="left:40px">
+    <h2><span class="num">1</span>Code</h2>
+    <div class="where">Git repository</div>
+    <ul>
+      <li><code>infra/</code> — one CloudFormation template</li>
+      <li><code>code/src/</code> — trainer, sampler, teacher client, preflight, eval</li>
+      <li><code>code/manifests/</code> — K8s templates + <code>env_vars</code></li>
+      <li><code>on_policy_distillation.ipynb</code> runs every step</li>
+    </ul>
+  </div>
+
+  <div class="card setup" style="left:510px">
+    <h2><span class="num">2</span>Provision</h2>
+    <div class="where">CloudFormation · single stack</div>
+    <ul>
+      <li>VPC, EKS (latest K8s), HyperPod cluster</li>
+      <li>FSx for Lustre <code>/fsx</code> + S3 <code>/s3</code> as PVCs</li>
+      <li>HyperPod Helm deps, add-ons, observability</li>
+      <li>SageMaker Studio space with the repo cloned</li>
+    </ul>
+  </div>
+
+  <div class="card setup" style="left:980px">
+    <h2><span class="num">3</span>Stage &amp; configure</h2>
+    <div class="where">Notebook · Part 0</div>
+    <ul>
+      <li><code>aws s3 sync src</code> &rarr; <code>/s3/opd/src</code></li>
+      <li>Teacher + student weights &rarr; S3</li>
+      <li><code>env_vars</code> &rarr; <code>envsubst</code> &rarr; ConfigMap <code>opd-config</code></li>
+      <li>ConfigMap is the only interface; account values in <code>env_vars.local</code></li>
+    </ul>
+  </div>
+
+  <div class="card setup" style="left:1450px; border-color:var(--teal); background:#f0fdfa">
+    <h2><span class="num" style="background:var(--teal)">4</span>Baseline &amp; pick the student</h2>
+    <div class="where">Part 1 · <code>teacher-vllm</code> + <code>student-sampler</code></div>
+    <ul>
+      <li>Serve the 9B teacher (vLLM, bf16, TP=2, GPUs 0–1)</li>
+      <li>Eval the teacher, then each candidate via the sampler</li>
+      <li>Same 1,319 GSM8K problems for every model</li>
+      <li>Comparison dashboard &rarr; the strongest student that still leaves a real gap</li>
+    </ul>
+  </div>
+
+  <!-- ============ RUN ROW ============ -->
+  <div class="card run distill">
+    <h2><span class="num" style="background:var(--orange);color:var(--ink)">5</span>On-policy distillation</h2>
+    <div class="where">Part 2–3 · Job <code>opd-student</code> (GPU 2) + Deployment <code>student-sampler</code> (GPU 3)</div>
+
+    <div class="node" style="left:22px; top:112px">
+      <b>Prompt pool</b><small>GSM8K train (7.5k)<br>4-shot chat template</small>
+    </div>
+    <div class="node sampler" style="left:246px; top:112px">
+      <b>Student samples</b><small>vLLM + LoRA hot-swap<br>64 prompts × 4 / step</small>
+    </div>
+    <div class="node teacher" style="left:470px; top:112px">
+      <b>Teacher scores</b><small>log&nbsp;π<sub>teacher</sub> per token<br>on student's own text</small>
+    </div>
+    <div class="node trainer" style="left:682px; top:112px">
+      <b>Update student</b><small>whitened reverse KL<br>answer masked · r=128</small>
+    </div>
+
+    <div class="side">
+      <div class="pill"><b>Safety gates</b><br>preflight + step-0 check: exit&nbsp;3 if reverse KL&nbsp;≤&nbsp;0</div>
+      <div class="pill"><b>Writes to /fsx/opd/gsm8k-opd</b><br>step adapters, merged final model, <code>metrics_rank0.jsonl</code></div>
+      <div class="pill"><b>Monitor</b><br><code>teacher_kl</code> with length · <code>truncated_frac</code> · answer lines</div>
+    </div>
+  </div>
+
+  <div class="card run eval">
+    <h2><span class="num">6</span>Evaluate</h2>
+    <div class="where">Part 4 · Job <code>opd-student-eval</code> (no GPU)</div>
+    <ul>
+      <li><code>eval_student.py</code> on Inspect AI</li>
+      <li>GSM8K, all 1,319 rows, 4-shot, <code>#### N</code> match</li>
+      <li><b>after</b> per checkpoint, greedy; best one again with an <b>8-vote majority</b></li>
+      <li><b>before</b> + <b>teacher</b> reused (greedy) from step 4</li>
+      <li><code>summary.json</code>, <code>samples_&lt;phase&gt;.jsonl</code> on <code>/fsx</code></li>
+    </ul>
+  </div>
+
+  <div class="card run dash">
+    <h2><span class="num">7</span>Eval dashboard</h2>
+    <div class="where">Notebook · from <code>summary.json</code> on <code>/fsx</code></div>
+    <div class="bars">
+      <div class="ceiling" style="bottom:118px"><span>teacher = ceiling</span></div>
+      <div class="bar" style="left:40px;  height:76px; background:var(--grey)"></div>
+      <div class="bar" style="left:150px; height:91px; background:var(--orange)"></div>
+      <div class="bar" style="left:260px; height:96px; background:var(--navy)"></div>
+      <div class="bar-lbl" style="left:40px">base</div>
+      <div class="bar-lbl" style="left:150px">distilled</div>
+      <div class="bar-lbl" style="left:260px">teacher</div>
+    </div>
+    <div class="formula"><b>headroom recovered</b> = (after − before) ÷ (teacher − before)</div>
+    <ul>
+      <li>Paired per-problem outcome: fixed vs. broken</li>
+      <li>Distilled student greedy and with an 8-vote majority, labelled</li>
+    </ul>
+  </div>
+
+  <!-- ============ HARDWARE / STORAGE BAND ============ -->
+  <div class="band">
+    <div class="node-box">
+      <div class="t">One <code>ml.g5.24xlarge</code> node <span>· 4× A10G 24 GB · GPUs are partitioned, not shared (2 + 1 + 1 = 4 of 4)</span></div>
+      <div class="gpus">
+        <div class="gpu g-teacher"><b>GPU 0</b>Teacher rank 0 (TP=2)</div>
+        <div class="gpu g-teacher"><b>GPU 1</b>Teacher rank 1 (TP=2)</div>
+        <div class="gpu g-student"><b>GPU 2</b>Student trainer (LoRA)</div>
+        <div class="gpu g-sampler"><b>GPU 3</b>Student sampler (vLLM) + eval</div>
+      </div>
+    </div>
+    <div class="store">
+      <div class="t">Shared storage <span>· mounted in every pod</span></div>
+      <b>/fsx</b> FSx for Lustre — HF cache, checkpoints, metrics, eval<br>
+      <b>/s3</b> S3 — code + model registry
+    </div>
+  </div>
+
+  <!-- ============ ARROWS ============ -->
+  <svg class="arrows" width="1920" height="1080" viewBox="0 0 1920 1080">
+    <defs>
+      <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#5f6b7a"/>
+      </marker>
+      <marker id="ah-o" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#ff9900"/>
+      </marker>
+    </defs>
+    <g stroke="#5f6b7a" stroke-width="3" fill="none" marker-end="url(#ah)">
+      <!-- setup row -->
+      <path d="M472,309 L506,309"/>
+      <path d="M942,309 L976,309"/>
+      <path d="M1412,309 L1446,309"/>
+      <!-- 4 -> 5 : down the right, across the gap, into distill -->
+      <path d="M1665,456 L1665,486 L490,486 L490,536" stroke-dasharray="8 6"/>
+      <!-- run row -->
+      <path d="M942,726 L976,726"/>
+      <path d="M1412,726 L1446,726"/>
+    </g>
+    <!-- distillation loop (inside panel 5; panel top = 540, nodes top = 652, height 88) -->
+    <g stroke="#ff9900" stroke-width="3" fill="none" marker-end="url(#ah-o)">
+      <path d="M260,698 L284,698"/>
+      <path d="M484,698 L508,698"/>
+      <path d="M708,698 L720,698"/>
+      <!-- adapter sync back to the sampler -->
+      <path d="M822,744 L822,772 L386,772 L386,746"/>
+    </g>
+    <text x="602" y="792" text-anchor="middle" font-size="14.5" fill="#b36b00" font-weight="700"
+          font-family="-apple-system, Helvetica Neue, Arial, sans-serif">sync LoRA adapter to the sampler every step</text>
+  </svg>
+
+</div>
+</body>
+</html>

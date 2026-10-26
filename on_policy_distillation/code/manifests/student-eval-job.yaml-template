@@ -1,0 +1,81 @@
+# STAGE 2 of 2: before / after / teacher evaluation with Inspect AI (src/eval_student.py).
+#
+# EVAL_PHASE=all (default) runs three phases against the SAME samples and prompt:
+#   before   -> ${EVAL_BASE_MODEL}       the pristine student from the Hub
+#   after    -> ${EVAL_FT_MODEL_DIR}     a student-step<N> adapter (served via the sampler)
+#   teacher  -> ${TEACHER_MODEL_ID}      through the teacher Service (needs it still running)
+#
+# The teacher phase is what makes the result interpretable. A student cannot be distilled
+# past its teacher, so `after - before` alone says nothing: the reported metric is
+#   headroom_recovered = (after - before) / (teacher - before)
+# If the teacher turns out NOT to be ahead of the base student, the summary says so
+# explicitly -- there is no headroom to distil and nothing downstream can create any.
+#
+# The task is the whole GSM8K test split (TASK / EVAL_LIMIT=1319): at n=100 the standard error
+# would be ~+-5pp, wider than most distillation gains. With EVAL_STUDENT_URL set every phase is
+# an HTTP client of vLLM, so the Job needs no GPU (EVAL_GPUS=0) and runs alongside training.
+#
+#   set -a && source manifests/env_vars && set +a
+#   aws s3 sync src s3://${S3_BUCKET}/opd/src
+#   envsubst < manifests/opd-config.yaml-template       | kubectl --context "$CTX" apply -f -
+#   envsubst < manifests/student-eval-job.yaml-template | kubectl --context "$CTX" apply -f -
+#   kubectl --context "$CTX" -n ${NAMESPACE} logs -f job/opd-student-eval
+#
+# Re-run by deleting the Job first (Jobs are immutable):
+#   kubectl --context "$CTX" -n ${NAMESPACE} delete job opd-student-eval --ignore-not-found
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: opd-student-eval
+  namespace: ${NAMESPACE}
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels: { app: opd-student-eval }
+    spec:
+      restartPolicy: OnFailure
+      nodeSelector:
+        node.kubernetes.io/instance-type: ${INSTANCE_TYPE}
+      tolerations:
+        - key: sagemaker.amazonaws.com/node-health-status
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: evaluator
+          image: ${EVAL_IMAGE}
+          envFrom:
+            - configMapRef: { name: opd-config }
+          env:
+            # HF_TOKEN for gated/rate-limited Hub pulls; the Job still runs without it.
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef: { name: hf-token, key: token, optional: true }
+          command: ["/bin/bash", "-c"]
+          args:
+            - >
+              pip install -q "inspect-ai" "datasets" "openai>=1.40" &&
+              case "${EVAL_PHASE}" in *after*|all|both)
+                echo "waiting for checkpoint ${EVAL_FT_MODEL_DIR} ...";
+                until [ -f "${EVAL_FT_MODEL_DIR}/config.json" ] || [ -f "${EVAL_FT_MODEL_DIR}/adapter_config.json" ]; do sleep 30; done;;
+              esac &&
+              cd ${CODE_DIR} &&
+              python3 eval_student.py &&
+              echo "--- ${EVAL_DIR}/${EVAL_SUMMARY_NAME} ---" &&
+              cat ${EVAL_DIR}/${EVAL_SUMMARY_NAME}
+          resources:
+            limits:
+              # 0 when EVAL_STUDENT_URL is set: every phase is then an HTTP client of a vLLM
+              # Service, so the eval can run while the trainer and sampler hold the node.
+              nvidia.com/gpu: ${EVAL_GPUS}
+          volumeMounts:
+            - { name: fsx, mountPath: /fsx }   # HF cache + checkpoints + eval logs
+            - { name: s3,  mountPath: /s3 }    # model registry + code
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: fsx
+          persistentVolumeClaim: { claimName: ${FSX_CLAIM} }
+        - name: s3
+          persistentVolumeClaim: { claimName: ${S3_CLAIM} }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 16Gi }
